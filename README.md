@@ -37,12 +37,12 @@ Each account gets its own Claude Code config folder (`CLAUDE_CONFIG_DIR`, for ex
 flowchart TD
     A["claude -p 'task'"] --> B["run it on the first account<br/>that has usage left"]
     B --> C{"how did it end?"}
-    C -->|"done, or an ordinary error"| D["pass the output through<br/>(after a move, a later error becomes<br/>the limit message or PARTIAL WORK DONE)"]
+    C -->|"done, or an ordinary error"| D["pass the output through<br/>(after a resume, a later error becomes<br/>the limit message or PARTIAL WORK DONE)"]
     C -->|"usage limit or login refused"| E["note the limit or the lapsed login<br/>pick the next account"]
     E --> F{"did any tool run?<br/>read the session transcript"}
     F -->|"no, or no transcript<br/>and refused within 90 s"| G["re-run the same command there"]
     F -->|"yes"| H["resume the same session there:<br/>continue, do not redo"]
-    F -->|"cannot tell"| I["stop and return the limit message"]
+    F -->|"cannot tell"| I["stop and return Claude's own message"]
     G --> C
     H --> C
 ```
@@ -111,7 +111,7 @@ For a single call, `CLAUDE_FAILOVER_ACCOUNT=<name>` pins one account, `CLAUDE_FA
 
 ## Design guarantees
 
-- **Never runs a task twice** - before it moves a run, the wrapper reads that run's transcript. It re-runs the command only when no tool call happened, or when there is no transcript and the refusal came within 90 seconds of the start. Otherwise it resumes the same session and tells the model to continue without repeating finished steps. When it cannot verify what happened, it does not move the run and returns Claude's own limit message. That covers runs with `--no-session-persistence` (no transcript), runs with `-c`/`--continue` (the session is not known in advance), resumes that would need a command-line option the wrapper does not know, and accounts whose folder kept its own `projects` instead of the link to `~/.claude/projects` (the wrapper cannot see their transcripts; `claude-accounts add`, `setup` and `status` name such folders). If a resumed run then fails for another reason, the caller never sees that unrelated error, which could invite a blind retry. It gets the original limit message, or a `claude-failover: PARTIAL WORK DONE` line that asks for a check before running the task again.
+- **Never runs a task twice** - before it moves a run, the wrapper reads that run's transcript. It re-runs the command only when no tool call happened, or when there is no transcript and the refusal came within 90 seconds of the start. Otherwise it resumes the same session and tells the model to continue without repeating finished steps. When it cannot verify what happened, it does not move the run and returns Claude's own message (the usage limit or the login error). That covers runs with `--no-session-persistence` (no transcript), runs with `-c`/`--continue` (the session is not known in advance), resumes that would need a command-line option the wrapper does not know, and accounts whose folder kept its own `projects` instead of the link to `~/.claude/projects` (the wrapper cannot see their transcripts; `claude-accounts add`, `setup` and `status` name such folders). If a resumed run then fails for another reason, the caller never sees that unrelated error, which could invite a blind retry. It gets the original limit message, or a `claude-failover: PARTIAL WORK DONE` line that asks for a check before running the task again.
 - **Never reads or copies your logins** - logins stay in the macOS keychain, where only `claude` itself uses them. The one secret the tool reads is the optional spare token. It is fetched from the keychain when a headless run's login is refused, and for the test calls of `claude-accounts token` and `claude-accounts test`. It is handed to `claude` in its environment and never written to disk.
 - **Never deletes a chat on its own** - desktop sync never touches transcripts. It removes a chat record only to carry over a deletion you made under another account. Every record it replaces or removes is moved to a trash folder first, which keeps the two newest copies of each file for up to 30 days. The first sync that changes anything also saves a backup of the chat records of every account in the config at that time.
 - **Quiet for scripts** - a headless run prints what `claude` printed (or the marker above) and adds no notes of its own to stderr, unless `CLAUDE_FAILOVER_VERBOSE=1` is set.

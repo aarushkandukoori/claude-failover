@@ -262,7 +262,8 @@ Each rule below closes one way that could happen.
   With no transcript in the shared projects folder, a fresh run refused within
   `turned_away_seconds` (90) is treated as turned away before it started and is re-run.
   This holds only because the account's `projects` is the shared one. Anything else stops
-  and returns the original limit message, which callers already handle.
+  and returns Claude's original message (the limit or the login error), which callers
+  already handle.
 - **Unknown CLI options block a resume.** The resume command is rebuilt from the caller's
   arguments: drop the prompt and the session flags, keep the rest, add `--resume <id>` and
   the continuation prompt. Finding the prompt means knowing which options take a value
@@ -497,7 +498,7 @@ this table lists all of them.
 | `accounts[].login_browser` | default browser | `"incognito"` opens the login page in a private Chrome window, for an account your normal browser is not signed in to. |
 | `order.interactive` | config order | Account order for chats and handoffs. |
 | `order.headless` | config order | Account order for `-p` runs. |
-| `default_login_account` | the account without its own folder, else the first | Account for subcommands such as `claude auth` and `claude update`. |
+| `default_login_account` | the account on the plain `Claude Code-credentials` login (no `config_dir`, or `securestorage_dir` set to `""`), else the first | Account for subcommands such as `claude auth` and `claude update`. |
 | `handoff.from_desktop`, `handoff.from_terminal` | `true` | Which chats the hook continues in Terminal. |
 | `handoff_model_fallbacks` | `["opus", "sonnet"]` | Models to try when the next account is out of the chat's model. |
 | `unknown_reset_minutes` | `30` | How long a limit with no stated reset time lasts. |

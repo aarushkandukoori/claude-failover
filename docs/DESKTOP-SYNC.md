@@ -94,8 +94,9 @@ Each run:
    when those are equal the copy whose content changed last wins. File times alone would
    mislead here: the app rewrites a record (its `lastFocusedAt`) whenever you open the
    chat, so an old copy you only looked at would look newest. Sync keeps a hash of each
-   record's content without `lastFocusedAt`, and when it last changed, in `seen.json` in
-   its state folder. While a record's content is unchanged, that remembered time stands.
+   record's content without `lastFocusedAt` or the fields each folder keeps for itself
+   (step 5), and when it last changed, in `seen.json` in its state folder. While a
+   record's content is unchanged, that remembered time stands.
    The first sync, with no `seen.json` yet, goes by file times.
 5. **Strip account-bound fields.** claude.ai connectors and Remote Control belong to one
    account, so these fields are removed before a record is written into another account:

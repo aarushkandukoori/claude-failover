@@ -395,10 +395,10 @@ def note(msg, headless=False):
 # Reading Claude's output: was this a usage limit, a lost login, or fine?
 # --------------------------------------------------------------------------
 
-# Prefixes Claude Code itself uses to classify usage-limit messages (the GSr/RTt
-# list in the 2.1.25x-2.1.29x binaries) plus the older wordings. Anchored at the
-# start of a line on purpose: "Server is temporarily limiting requests (not your
-# usage limit)" is a server throttle, not our limit, and must not match.
+# Prefixes Claude Code itself uses for its usage-limit messages (2.1.25x-2.1.29x),
+# plus the older wordings. Anchored at the start of a line on purpose: "Server is
+# temporarily limiting requests (not your usage limit)" is a server throttle, not
+# our limit, and must not match.
 APOS = "['’]"
 LIMIT_RE = re.compile(
     r"^\s*(?:API Error:\s*)?(?:"
@@ -983,10 +983,10 @@ def child_env(cfg, name, base=None, managed=False):
         env["CLAUDE_CONFIG_DIR"] = acct["config_dir"]   # exact absolute path: keychain item = sha256 of it
     if "securestorage_dir" in acct and acct["securestorage_dir"] is not None:
         # "" = use the plain keychain item 'Claude Code-credentials' (and ~/.claude for
-        # its lock) while settings/.claude.json live in config_dir. Claude Code's own
-        # override (uw()/FF() in the binary); it lets an account keep the plain login
-        # without sharing ~/.claude.json, which the desktop app rewrites with its own
-        # account.
+        # its lock) while settings/.claude.json live in config_dir. Claude Code reads
+        # this variable (it is not a documented setting); it lets an account keep the
+        # plain login without sharing ~/.claude.json, which the desktop app rewrites
+        # with its own account.
         env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = acct["securestorage_dir"]
     env["CLAUDE_FAILOVER_ACTIVE_ACCOUNT"] = name
     if managed:
@@ -2771,7 +2771,8 @@ def accounts_main(argv):
                   rest[0], when.strftime("%b %-d"), renew.strftime("%b %-d"), expires.strftime("%b %-d")))
         return 0
     if cmd == "token":
-        # A one-year spare token for headless runs whose login is refused (README: Spare token).
+        # A one-year spare token for headless runs whose login is refused
+        # (docs/ARCHITECTURE.md, Login clock and spare token).
         if not rest or rest[0] not in cfg["by_name"]:
             print("usage: claude-accounts token <%s>" % "|".join(cfg["by_name"]))
             return 2

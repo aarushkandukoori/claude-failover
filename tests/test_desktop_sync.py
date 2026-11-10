@@ -319,6 +319,41 @@ class FreshnessTest(Base):
         self.assertEqual(renamed.read_bytes(), renamed_bytes)
         self.assertEqual(self.trash(P_ACCT), [])
 
+    def test_a_save_that_only_adds_connector_tools_does_not_revert_a_rename(self):
+        # A record whose tools are all claude.ai connectors is copied without
+        # enabledMcpTools. The app in the other account may later save the copy with
+        # that account's own connector entries (a connector switch in the chat). That
+        # is not an edit, so it must not win over a rename made on the first account.
+        now = time.time()
+        self.record("personal", "s1", title="old name", mtime=now - 1000,
+                    enabledMcpTools={CONNECTOR + ":search": True})
+        self.assertEqual(self.sync()["added"], 1)
+        self.assertNotIn("enabledMcpTools", self.load("work", "s1"))
+        renamed = self.record("personal", "s1", title="new name", isArchived=True, mtime=now - 500,
+                              enabledMcpTools={CONNECTOR + ":search": True})
+        saved = self.load("work", "s1")
+        saved["enabledMcpTools"] = {OTHER_CONNECTOR + ":search": False}
+        self.path("work", "s1").write_text(json.dumps(saved))
+        os.utime(str(self.path("work", "s1")), (now, now))
+        renamed_bytes = renamed.read_bytes()
+        self.sign_in(W_ACCT, running=True)
+        r = self.sync()
+        self.assertEqual((r["updated"], r["stale_in_running_app"]), (0, 1))
+        self.assertEqual(renamed.read_bytes(), renamed_bytes)
+        os.environ["CLAUDE_FAILOVER_APP_RUNNING"] = "0"   # the app quit: work catches up
+        self.assertEqual(self.sync()["updated"], 1)
+        got = self.load("work", "s1")
+        self.assertEqual((got["title"], got["isArchived"]), ("new name", True))
+        self.assertEqual(got["enabledMcpTools"], {OTHER_CONNECTOR + ":search": False})
+        self.assertEqual(self.trash(P_ACCT), [])
+
+    def test_tools_without_a_local_entry_hash_like_no_field(self):
+        rec = {"sessionId": "local_s1", "title": "t", "lastActivityAt": BASE_MS}
+        key = ds.content_key(rec)
+        self.assertEqual(ds.content_key(dict(rec, enabledMcpTools={CONNECTOR + ":a": False})), key)
+        self.assertEqual(ds.content_key(dict(rec, enabledMcpTools={})), key)
+        self.assertNotEqual(ds.content_key(dict(rec, enabledMcpTools={"local:x": True})), key)
+
     def test_focus_only_difference_is_not_copied(self):
         now = time.time()
         self.record("personal", "s1", mtime=now - 1000)

@@ -8,14 +8,15 @@
 #
 # Follow the symlink chain to this script's real folder first: the wrapper
 # lives next to the real file, not next to a link that points at it.
+# readlink and dirname by absolute path: a caller's PATH may leave out /usr/bin.
 self=$0
 hops=0
 while [ -L "$self" ] && [ "$hops" -lt 40 ]; do   # 40: a link loop can't hang us
-    link=$(readlink "$self")
+    link=$(/usr/bin/readlink "$self")
     case $link in
-        /*) self=$link ;;                       # absolute link target
-        *) self=$(dirname "$self")/$link ;;     # relative to the link's own folder
+        /*) self=$link ;;                                # absolute link target
+        *) self=$(/usr/bin/dirname "$self")/$link ;;     # relative to the link's own folder
     esac
     hops=$((hops + 1))
 done
-exec "$(dirname "$self")/claude-failover" "$@"
+exec "$(/usr/bin/dirname "$self")/claude-failover" "$@"

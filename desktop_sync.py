@@ -418,14 +418,20 @@ def content_key(record):
     """A hash of what a record says, leaving out what changes with no edit:
     lastFocusedAt (the app rewrites the file with a new one whenever a chat is
     opened), the account-bound fields and runtime markers (each folder keeps its
-    own) and enabledMcpTools entries that are not local:. None if it can't be
-    hashed. Two copies with the same key say the same thing."""
+    own) and enabledMcpTools entries that are not local:. An enabledMcpTools with
+    no local: entry counts as no field, the same rule as payload_for: a copy
+    written without the field must not look edited when the app later saves the
+    account's own connector entries into it. None if it can't be hashed. Two
+    copies with the same key say the same thing."""
     data = {}
     for key, value in record.items():
         if key == "lastFocusedAt" or key in ACCOUNT_BOUND_FIELDS or key in RUNTIME_FIELDS:
             continue
-        if key == "enabledMcpTools" and isinstance(value, dict):
-            value = {k: v for k, v in value.items() if k.startswith(LOCAL_TOOL_PREFIX)}
+        if key == "enabledMcpTools":
+            value = ({k: v for k, v in value.items() if k.startswith(LOCAL_TOOL_PREFIX)}
+                     if isinstance(value, dict) else {})
+            if not value:
+                continue
         data[key] = value
     try:
         text = json.dumps(data, sort_keys=True, separators=(",", ":"))

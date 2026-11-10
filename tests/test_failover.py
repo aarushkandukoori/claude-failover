@@ -7,6 +7,7 @@ import datetime as dt
 import io
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -350,6 +351,25 @@ class HeadlessTests(Sandbox):
         r = self.run_wrapper(["-p", "send it"])
         self.assertEqual(r.returncode, 1)
         self.assertIn("hit your session limit", r.stdout)
+
+    def test_a_rerun_passes_the_next_accounts_own_error_through(self):
+        # Nothing ran before the move, so the later error is the run's real outcome.
+        self.plan(A="limit", default="error")
+        r = self.run_wrapper(["-p", "hi"])
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("something else broke", r.stdout)
+        self.assertNotIn("hit your session limit", r.stdout)
+        self.assertNotIn("PARTIAL WORK DONE", r.stdout)
+        self.assertEqual([c["acct"] for c in self.calls()], ["A", "default"])
+
+    def test_a_refused_login_it_cannot_check_returns_the_login_error(self):
+        # No transcript to read, so the run is not moved: the caller gets Claude's own
+        # login error, and no other account is tried.
+        self.plan(A="auth", default="ok")
+        r = self.run_wrapper(["-p", "hi", "--no-session-persistence"])
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("Not logged in", r.stdout)
+        self.assertEqual([c["acct"] for c in self.calls()], ["A"])
 
     def test_subcommands_use_default_account(self):
         self.plan(A="ok", default="ok")
@@ -2016,6 +2036,21 @@ class GitignoreTests(unittest.TestCase):
             self.assertEqual(check(path), 0, path)
         for path in ("config.example.json", "tests/fake_claude.py", "README.md"):
             self.assertEqual(check(path), 1, path)
+
+
+class DocLinkTests(unittest.TestCase):
+
+    def test_code_comments_name_doc_sections_that_exist(self):
+        # A comment such as "(docs/ARCHITECTURE.md, Login clock and spare token)" must
+        # name a real heading of that file, so a reader can find the section.
+        pat = re.compile(r"\((README(?:\.md)?|docs/[A-Z-]+\.md)[:,] ([^)\n]+)\)")
+        for src in ("claude_failover.py", "desktop_sync.py"):
+            for m in pat.finditer((PROJECT / src).read_text()):
+                doc = "README.md" if m.group(1).startswith("README") else m.group(1)
+                heads = {line.lstrip("#").strip().lower()
+                         for line in (PROJECT / doc).read_text().splitlines()
+                         if line.startswith("#")}
+                self.assertIn(m.group(2).strip().lower(), heads, "%s: %s" % (src, m.group(0)))
 
 
 if __name__ == "__main__":
