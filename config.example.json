@@ -1,0 +1,38 @@
+{
+  "default_config_dir": "~/.claude",
+  "state_dir": "~/.config/claude-failover/state",
+  "handoff_dir": "~/.config/claude-failover/handoffs",
+  "accounts": [
+    {
+      "name": "personal",
+      "email": "you@example.com",
+      "config_dir": "~/.claude-personal"
+    },
+    {
+      "name": "work",
+      "email": "you@work.example",
+      "config_dir": "~/.claude-work",
+      "desktop_account_uuid": null,
+      "desktop_org_uuid": null,
+      "securestorage_dir": null,
+      "login_browser": "incognito"
+    }
+  ],
+  "order": {
+    "interactive": ["personal", "work"],
+    "headless": ["work", "personal"]
+  },
+  "default_login_account": "personal",
+  "handoff": {
+    "from_desktop": true,
+    "from_terminal": true
+  },
+  "handoff_model_fallbacks": ["opus", "sonnet"],
+  "unknown_reset_minutes": 30,
+  "auth_down_recheck_minutes": 30,
+  "turned_away_seconds": 90,
+  "desktop_sync": {
+    "enabled": false,
+    "interval_minutes": 10
+  }
+}

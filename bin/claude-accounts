@@ -1,0 +1,7 @@
+#!/usr/bin/python3 -I
+# Set up and look after the Claude accounts claude-failover uses:
+# init / add / status / login / hook / sync and more (run it with --help).
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+from claude_failover import accounts_main
+sys.exit(accounts_main(sys.argv[1:]))

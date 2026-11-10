@@ -1,0 +1,20 @@
+# Per-machine files. Your accounts, saved limits, event log and handoff
+# scripts stay on your Mac. Anchored to the repo root (where the legacy
+# layout keeps them) so test fixtures with the same names are not hidden.
+/config.json
+/state/
+/handoffs/
+
+# Option table generated from the installed claude binary
+# by `claude-accounts argspec`.
+/argspec.json
+
+# Temp files an interrupted atomic write can leave next to config.json or argspec.json.
+/config.json.*
+/argspec.json.*
+
+# Python and macOS noise.
+__pycache__/
+*.pyc
+.DS_Store
+*.bak-*

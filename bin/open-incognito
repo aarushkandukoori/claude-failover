@@ -1,0 +1,4 @@
+#!/bin/bash
+# BROWSER for `claude-accounts login` on accounts Chrome's normal profile is not
+# signed in to: the login page opens in a private window with no claude.ai session.
+exec /usr/bin/open -na "Google Chrome" --args --incognito "$1"

@@ -1,0 +1,33 @@
+#!/usr/bin/python3 -I
+# StopFailure hook (`claude-accounts hook install` adds it to settings.json): a
+# chat hit a usage limit -> record it and continue the conversation on the next
+# account in Terminal.
+# Reads the payload and checks which kind of claude process fired it, then
+# detaches so Claude never waits on it (and a session that is shutting down
+# cannot cut the handoff off halfway).
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+try:
+    payload = sys.stdin.read()
+    from claude_failover import hook_main, parent_is_print_run
+    print_run = parent_is_print_run()   # before the fork: afterwards the parent is launchd
+except Exception:
+    sys.exit(0)
+if os.environ.get("CLAUDE_FAILOVER_HOOK_FOREGROUND") != "1":
+    try:
+        if os.fork() > 0:
+            os._exit(0)
+        os.setsid()
+        devnull = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(devnull, fd)
+    except OSError:
+        pass
+try:
+    hook_main(payload, print_run=print_run)
+except Exception as e:  # a hook must never break the session
+    try:
+        sys.stderr.write("claude-failover-hook: %s\n" % e)
+    except Exception:
+        pass
+os._exit(0)

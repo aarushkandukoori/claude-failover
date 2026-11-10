@@ -1,0 +1,21 @@
+#!/bin/sh
+# `claude` on PATH -> claude-failover. Put this bin/ folder first on PATH (or
+# symlink this file as `claude` into a folder that is), so scripts and
+# subprocesses that run plain `claude` get the wrapper too. There every -p run
+# is pinned to an explicit permission mode, so a bypassPermissions default in
+# settings.json never reaches a headless job. The real binary is found by the
+# wrapper (config real_claude, or auto-detected).
+#
+# Follow the symlink chain to this script's real folder first: the wrapper
+# lives next to the real file, not next to a link that points at it.
+self=$0
+hops=0
+while [ -L "$self" ] && [ "$hops" -lt 40 ]; do   # 40: a link loop can't hang us
+    link=$(readlink "$self")
+    case $link in
+        /*) self=$link ;;                       # absolute link target
+        *) self=$(dirname "$self")/$link ;;     # relative to the link's own folder
+    esac
+    hops=$((hops + 1))
+done
+exec "$(dirname "$self")/claude-failover" "$@"

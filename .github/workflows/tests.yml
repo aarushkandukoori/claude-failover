@@ -1,0 +1,22 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unittest:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v5
+
+      - name: Show the system Python
+        run: /usr/bin/python3 --version
+
+      - name: Run the unit tests
+        run: /usr/bin/python3 -m unittest discover -s tests -v

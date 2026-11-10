@@ -1,0 +1,7 @@
+#!/usr/bin/python3 -I
+# Drop-in replacement for the claude binary that fails over between Claude
+# accounts on usage limits. See ../README.md.
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+from claude_failover import main
+sys.exit(main(sys.argv[1:]))
