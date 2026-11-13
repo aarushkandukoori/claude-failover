@@ -1718,7 +1718,21 @@ def effective_real_claude():
         return ""
 
 
+def memguard_gate(argv):
+    """Headless runs (-p/--print, like the 5 AM jobs) wait while memguard says memory is in
+    danger (up to 30 min), so background work never piles onto a nearly full Mac."""
+    if "-p" not in argv and "--print" not in argv:
+        return
+    mg = os.path.expanduser("~/Projects/memguard/memguard.py")
+    if os.path.exists(mg):
+        try:
+            subprocess.run(["/usr/bin/python3", "-I", mg, "wait", "--max", "1800"], timeout=1900)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
 def main(argv):
+    memguard_gate(argv)
     cfg = load_config()
     missing = claude_missing(cfg)
     if missing:
