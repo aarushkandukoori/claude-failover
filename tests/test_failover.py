@@ -1450,7 +1450,8 @@ class TwoClonesTest(unittest.TestCase):
     def clone(self, name):
         d = self.tmp / name
         shutil.copytree(str(PROJECT / "bin"), str(d / "bin"))
-        for f in ("claude_failover.py", "desktop_sync.py", "desktop_tasks.py", "install.sh"):
+        for f in ("claude_failover.py", "desktop_sync.py", "desktop_tasks.py",
+                  "desktop_handover.py", "desktop_backlog.py", "install.sh"):
             shutil.copy2(str(PROJECT / f), str(d / f))
         return d
 
@@ -2053,7 +2054,8 @@ class DocLinkTests(unittest.TestCase):
         # A comment such as "(docs/ARCHITECTURE.md, Login clock and spare token)" must
         # name a real heading of that file, so a reader can find the section.
         pat = re.compile(r"\((README(?:\.md)?|docs/[A-Z-]+\.md)[:,] ([^)\n]+)\)")
-        for src in ("claude_failover.py", "desktop_sync.py", "desktop_tasks.py"):
+        for src in ("claude_failover.py", "desktop_sync.py", "desktop_tasks.py",
+                    "desktop_handover.py", "desktop_backlog.py"):
             for m in pat.finditer((PROJECT / src).read_text()):
                 doc = "README.md" if m.group(1).startswith("README") else m.group(1)
                 heads = {line.lstrip("#").strip().lower()

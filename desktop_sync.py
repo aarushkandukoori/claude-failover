@@ -49,6 +49,8 @@ import time
 from pathlib import Path
 
 import claude_failover as cf
+import desktop_backlog
+import desktop_handover
 import desktop_tasks
 
 REPO = Path(__file__).resolve().parent
@@ -64,9 +66,18 @@ MAX_TOMBSTONE_BYTES = 4096             # a tombstone holds one number
 MAX_TASKS_BYTES = 10 * 1024 * 1024
 TASKS_FILE = "scheduled-tasks.json"
 TASKS_WRITTEN_FILE = "tasks-written.json"   # per account: a hash of the task list we wrote last
-TASK_BACKUP_RE = re.compile(r"^scheduled-tasks\.(\d{8})-(\d{6})(?:-(\d+))?\.json$")
+TASK_BACKUP_RE = re.compile(r"^(scheduled-tasks|backlog)\.(\d{8})-(\d{6})(?:-(\d+))?\.json$")
+BACKLOG_DIR, BACKLOG_FILE = "backlog", "tasks.json"   # <account>/<org>/backlog/tasks.json
+BACKLOG_SEEN_FILE = "backlog-seen.json"     # per account: the items its backlog held at the last sync
+MAX_BACKLOG_BYTES = 32 * 1024 * 1024        # the app reads no bigger backlog file
 TASK_BACKUP_DAYS = 30
 TASK_BACKUP_KEEP = 5           # newest task-list backups kept per account, whatever their age
+HANDOVER_HOURS = 48            # `sync handover` looks at chats that were active this recently
+TAIL_BYTES = 512 * 1024        # how much of a transcript's end is read first
+TAIL_MAX_BYTES = 32 * 1024 * 1024
+PS_RE = re.compile(r"^\s*(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)\s+(.*)$")   # [[days-]hours:]minutes:seconds command
+CLAUDE_COMMAND_RE = re.compile(r"(?:^|/)claude\s")
+SESSION_FLAG_RE = re.compile(r"\s--(?:resume|session-id)[= ]([0-9A-Za-z-]{8,})")
 ACTIVITY_FIELDS = ("lastActivityAt", "lastTurnEdgeAt", "latestUserFrameAt")
 # claude.ai connectors and Remote Control belong to one account. A record without
 # these fields makes the app use the account's own settings.
@@ -92,13 +103,16 @@ COUNTS = ("added", "added_needs_restart", "updated", "retired", "stale_in_runnin
 
 USAGE = """usage: claude-accounts sync [--dry-run] [--quiet] [--json]
        claude-accounts sync install [--every MINUTES] | sync uninstall | sync status
+       claude-accounts sync handover [--json] [--hours N]
 
   sync              copy desktop app chats so every account lists every chat, and
                     copy the signed-in account's scheduled tasks to the other accounts
   sync install      also sync in the background (every 10 min by default)
   sync uninstall    stop the background sync
   sync status       the background job, the last sync, and whether the
-                    scheduled task lists match"""
+                    scheduled task lists match
+  sync handover     the chats that were left in the middle of their work (cut
+                    off by a sign-out, stopped by a usage limit) or wait for you"""
 
 
 class Unsafe(Exception):
@@ -605,21 +619,26 @@ def task_key(folder):
     return "%s/%s" % (folder["account_uuid"], folder["org_uuid"])
 
 
-def backup_tasks(sdir, folder, raw, now):
+def written_key(folder, kind):
+    """The key of one list in tasks-written.json."""
+    return task_key(folder) + ("" if kind == "scheduled-tasks" else "#" + kind)
+
+
+def backup_tasks(sdir, folder, raw, now, kind="scheduled-tasks"):
     """Save an account's task list as it is, before it is replaced: the first time
     each day, and whenever the file is not the one this tool wrote last (the app
     or a person changed it since). Returns the copy's path, or None when no copy
-    was needed."""
+    was needed. `kind` names the list: "scheduled-tasks" or "backlog"."""
     bdir = private_dir(Path(sdir) / "task-backups")
     for part in (folder["account_uuid"], folder["org_uuid"]):
         bdir = private_dir(bdir / part)
     written = cf.read_json(Path(sdir) / TASKS_WRITTEN_FILE, {})
     ours = (isinstance(written, dict)
-            and written.get(task_key(folder)) == hashlib.sha256(raw).hexdigest())
-    today = "scheduled-tasks.%s-" % now.strftime("%Y%m%d")
+            and written.get(written_key(folder, kind)) == hashlib.sha256(raw).hexdigest())
+    today = "%s.%s-" % (kind, now.strftime("%Y%m%d"))
     if ours and any(name.startswith(today) for name in os.listdir(str(bdir))):
         return None
-    base = "scheduled-tasks.%s" % now.strftime("%Y%m%d-%H%M%S")
+    base = "%s.%s" % (kind, now.strftime("%Y%m%d-%H%M%S"))
     dest, n = bdir / (base + ".json"), 2
     while os.path.lexists(str(dest)):
         dest, n = bdir / ("%s-%d.json" % (base, n)), n + 1
@@ -631,34 +650,39 @@ def backup_tasks(sdir, folder, raw, now):
     return dest
 
 
-def remember_tasks_write(sdir, folder, data):
-    """Note the hash of the task list just written, so the next run can tell
-    its own work from a change by the app or a person (see backup_tasks)."""
+def remember_tasks_write(sdir, folder, data, kind="scheduled-tasks"):
+    """Note the hash of the list just written, so the next run can tell its own
+    work from a change by the app or a person (see backup_tasks)."""
     path = Path(sdir) / TASKS_WRITTEN_FILE
     written = cf.read_json(path, {})
     written = written if isinstance(written, dict) else {}
-    written[task_key(folder)] = hashlib.sha256(data).hexdigest()
+    written[written_key(folder, kind)] = hashlib.sha256(data).hexdigest()
     cf.atomic_write_json(path, written)
 
 
 def prune_task_backups(sdir, now=None):
-    """Drop task-list backups older than TASK_BACKUP_DAYS, but keep the
-    TASK_BACKUP_KEEP newest of every account whatever their age. The date comes
-    from the file name."""
+    """Drop list backups older than TASK_BACKUP_DAYS, but keep the
+    TASK_BACKUP_KEEP newest of every account and kind of list whatever their
+    age. The date comes from the file name."""
     now = cf.now_local() if now is None else now
     oldest = (now - dt.timedelta(days=TASK_BACKUP_DAYS)).strftime("%Y%m%d")
     removed = 0
     for folder, _dirs, files in os.walk(str(Path(sdir) / "task-backups")):
-        copies = [(m.group(1), m.group(2), int(m.group(3) or 1), name)
-                  for name in files for m in [TASK_BACKUP_RE.match(name)] if m]
-        copies.sort(reverse=True)   # newest first: date, time, then the -2, -3 of one second
-        for day, _time, _n, name in copies[TASK_BACKUP_KEEP:]:
-            if day < oldest:
-                try:
-                    os.unlink(os.path.join(folder, name))
-                    removed += 1
-                except OSError:
-                    pass
+        kinds = {}
+        for name in files:
+            m = TASK_BACKUP_RE.match(name)
+            if m:
+                kinds.setdefault(m.group(1), []).append(
+                    (m.group(2), m.group(3), int(m.group(4) or 1), name))
+        for copies in kinds.values():
+            copies.sort(reverse=True)   # newest first: date, time, then the -2, -3 of one second
+            for day, _time, _n, name in copies[TASK_BACKUP_KEEP:]:
+                if day < oldest:
+                    try:
+                        os.unlink(os.path.join(folder, name))
+                        removed += 1
+                    except OSError:
+                        pass
     return removed
 
 
@@ -669,13 +693,14 @@ def org_is_named(cfg, account):
                for a in (accounts if isinstance(accounts, list) else []))
 
 
-def tasks_in_another_org(cfg, folder):
+def tasks_in_another_org(cfg, folder, count=None):
     """True if another organization folder of the same account also holds tasks
     and the config does not say which folder the account uses. The app's config
     names the account only, so the folder we picked may not be the one the app
     reads: a stale list would be copied, or the copy would go where the app does
     not look. Empty lists do not count: the app leaves those behind when it
-    switches accounts."""
+    switches accounts. `count` = how many entries an organization folder holds
+    (scheduled tasks when not given)."""
     if org_is_named(cfg, folder["account"]):
         return False
     base = Path(folder["path"]).parent
@@ -687,10 +712,13 @@ def tasks_in_another_org(cfg, folder):
         if name == folder["org_uuid"] or not is_real_dir(base / name):
             continue
         try:
-            doc, _raw, _st = read_tasks(base / name / TASKS_FILE)
-        except (Unsafe, desktop_tasks.NotATaskList, OSError):
+            if count is not None:
+                held = count(base / name)
+            else:
+                held = len(read_tasks(base / name / TASKS_FILE)[0]["scheduledTasks"])
+        except (Unsafe, desktop_tasks.NotATaskList, desktop_backlog.NotABacklog, OSError):
             return True   # cannot tell what it holds
-        if doc["scheduledTasks"]:
+        if held:
             return True
     return False
 
@@ -874,6 +902,454 @@ def task_status_lines(cfg):
             lines.append("  scheduled tasks - DIFFER: only on %s and still on: %s (sync never "
                          "deletes a task)" % (who, ", ".join(live)))
     return lines
+
+
+# --------------------------------------------------------------------------
+# The task backlog
+# --------------------------------------------------------------------------
+
+def backlog_on(cfg):
+    """The backlog is mirrored unless the config says "desktop_sync": {"backlog": false}."""
+    return settings(cfg).get("backlog") is not False
+
+
+def read_backlog(folder_path):
+    """(document, raw bytes, stat) of an account folder's backlog/tasks.json. A
+    missing file is ({"version": 1, "items": []}, None, None). Raises Unsafe or
+    desktop_backlog.NotABacklog for a file to leave alone."""
+    try:
+        data, st = read_regular(Path(folder_path) / BACKLOG_DIR / BACKLOG_FILE, MAX_BACKLOG_BYTES)
+    except FileNotFoundError:
+        return {"version": desktop_backlog.NEWEST_VERSION, "items": []}, None, None
+    return desktop_backlog.parse(data), data, st
+
+
+def backlog_count(folder_path):
+    return len(read_backlog(folder_path)[0]["items"])
+
+
+def mirror_backlog(cfg, folders, active, sdir, dry_run, errors):
+    """Make every other account's task backlog hold what the signed-in account's
+    holds, by the rules in desktop_backlog.plan. Returns the "backlog" part of
+    the report. The signed-in account's file is only read. A dry run writes
+    nothing."""
+    out = {"on": backlog_on(cfg), "source": None, "items": 0, "note": None, "targets": []}
+    if not out["on"]:
+        out["note"] = "turned off in the config (desktop_sync.backlog)"
+        return out
+    mine = [f for f in folders if same_id(f["account_uuid"], active)]
+    if len(folders) < 2 or len(mine) != 1:
+        return out   # the scheduled-task lines say why nothing is copied
+    src = mine[0]
+    if tasks_in_another_org(cfg, src, backlog_count):
+        out["note"] = "%s is signed in and has a backlog in more than one organization folder" % (
+            src["account"])
+        return out
+    try:
+        doc, raw, _st = read_backlog(src["path"])
+    except (Unsafe, desktop_backlog.NotABacklog, OSError) as e:
+        out["note"] = "cannot read the backlog of %s (%s)" % (src["account"], why(e))
+        return out
+    if raw is None:
+        return out   # no backlog file yet: nothing to copy, and nothing known to be removed
+    out["source"], out["items"] = src["account"], len(doc["items"])
+    state = Path(sdir if sdir is not None else sync_dir()) / BACKLOG_SEEN_FILE
+    seen = cf.read_json(state, {})
+    seen = seen if isinstance(seen, dict) else {}
+    before = seen.get(task_key(src))
+    before = before if isinstance(before, list) else None
+    now_ms = time.time() * 1000
+    after = {task_key(src): desktop_backlog.keys(doc["items"])}
+    for dst in folders:
+        if dst is not src:
+            row, left = _backlog_into(cfg, doc["items"], before, dst, now_ms, sdir, dry_run, errors)
+            out["targets"].append(row)
+            if left is not None:
+                after[task_key(dst)] = left
+    if not dry_run and any(seen.get(k) != v for k, v in after.items()):
+        try:
+            cf.atomic_write_json(state, dict(seen, **after))
+        except (OSError, TypeError, ValueError) as e:
+            errors.append("could not save %s: %s" % (tilde(state), why(e)))
+    return out
+
+
+def _backlog_into(cfg, items, before, dst, now_ms, sdir, dry_run, errors):
+    """One other account: (its row of the report, the keys its list holds after
+    this run or None when the list could not be read)."""
+    row = {"account": dst["account"], "added": [], "removed": [], "only_there": 0,
+           "written": False, "backup": None, "note": None}
+    if tasks_in_another_org(cfg, dst, backlog_count):
+        row["note"] = "it has a backlog in more than one organization folder"
+        return row, None
+    try:
+        doc, raw, st = read_backlog(dst["path"])
+    except (Unsafe, desktop_backlog.NotABacklog, OSError) as e:
+        row["note"] = "its backlog cannot be read (%s)" % why(e)
+        return row, None
+    new_list, row["added"], row["removed"], row["only_there"] = desktop_backlog.plan(
+        items, doc["items"], before, now_ms)
+    old_keys = desktop_backlog.keys(doc["items"])
+    if not (row["added"] or row["removed"]) or dry_run:
+        return row, old_keys
+    folder = dst["path"] / BACKLOG_DIR
+    try:
+        data = desktop_backlog.encode(dict(doc, items=new_list))
+        if desktop_backlog.parse(data)["items"] != new_list:
+            raise ValueError("the new list does not read back as written")
+        if len(data) > MAX_BACKLOG_BYTES:
+            raise ValueError("the new list would be over %d bytes" % MAX_BACKLOG_BYTES)
+        if st is not None:
+            backup = backup_tasks(sdir, dst, raw, cf.now_local(), "backlog")
+            row["backup"] = str(backup) if backup else None
+        elif not is_real_dir(folder):
+            os.mkdir(str(folder), 0o700)   # the app makes this folder the same way
+        write_file(folder, BACKLOG_FILE, data, expect=ident(st) if st is not None else None,
+                   mode=stat.S_IMODE(st.st_mode) if st is not None else None)
+    except Changed:
+        row["note"] = "its backlog changed during the sync (the next run catches up)"
+        return row, old_keys
+    except (OSError, ValueError, desktop_backlog.NotABacklog) as e:
+        errors.append("could not update the task backlog of %s: %s" % (dst["account"], why(e)))
+        return row, old_keys
+    row["written"] = True
+    try:
+        remember_tasks_write(sdir, dst, data, "backlog")
+    except (OSError, TypeError, ValueError):
+        pass   # the next run then makes one backup more than needed
+    return row, desktop_backlog.keys(new_list)
+
+
+def backlog_lines(r):
+    """What `claude-accounts sync` prints about the task backlog: only changes and
+    lists that were left alone."""
+    b = r.get("backlog") or {}
+    rows = [row for row in b.get("targets", []) if row["added"] or row["removed"] or row["note"]]
+    if not b.get("source") or not rows:
+        return ["Task backlog - not copied: %s" % b["note"]] if b.get("on") and b.get("note") else []
+    dry = r["dry_run"]
+    lines = ["Task backlog (copied from %s, the signed-in account)%s" % (
+        b["source"], " - dry run, nothing written" if dry else "")]
+    for row in rows:
+        who, done = row["account"], row["written"]
+        parts = []
+        if row["added"]:
+            parts.append("%d %s" % (len(row["added"]), "added" if done else "to add"))
+        if row["removed"]:
+            parts.append("%d %s" % (len(row["removed"]), "removed" if done else "to remove"))
+        if parts:
+            lines.append("  %s: %s%s" % (who, ", ".join(parts), "" if done or dry else " - NOT written"))
+            lines.extend("    add - %s" % one_line(t, 100) for t in row["added"])
+            lines.extend("    remove - %s (started or dropped on %s)" % (one_line(t, 100), b["source"])
+                         for t in row["removed"])
+        if row["note"]:
+            lines.append("  %s: left alone - %s" % (who, row["note"]))
+        if row["backup"]:
+            lines.append("  %s: backup - its list as it was: %s" % (who, tilde(row["backup"])))
+    return lines
+
+
+def backlog_status_lines(cfg):
+    """For `sync status`: do the task backlogs match right now? It reads the files
+    and writes nothing. Never raises."""
+    try:
+        ddir = desktop_dir(cfg)
+        folders, _skipped = resolve_folders(cfg, ddir)
+        b = mirror_backlog(cfg, folders, active_account_uuid(ddir), None, True, [])
+    except Exception:
+        return []
+    if not b["on"]:
+        return ["  task backlog - not copied (desktop_sync.backlog is false in the config)"]
+    if not b["source"]:
+        return ["  task backlog - not copied: %s" % b["note"]] if b["note"] else []
+    lines = []
+    for row in b["targets"]:
+        who, behind = row["account"], len(row["added"]) + len(row["removed"])
+        extra = ", plus %s only on %s" % (plural(row["only_there"], "item"), who) \
+            if row["only_there"] else ""
+        if row["note"]:
+            lines.append("  task backlog - %s left alone: %s" % (who, row["note"]))
+        elif behind:
+            lines.append("  task backlog - %s is %s behind %s (signed in), the next sync copies %s"
+                         % (who, plural(behind, "change"), b["source"], "it" if behind == 1 else "them"))
+        elif b["items"] or row["only_there"]:
+            lines.append("  task backlog - %s matches %s (signed in, %s)%s" % (
+                who, b["source"], plural(b["items"], "item"), extra))
+    return lines
+
+
+# --------------------------------------------------------------------------
+# Chats to pick up
+# --------------------------------------------------------------------------
+
+def parse_ps(text, now):
+    """(ids, starts) from the output of `ps -axo etime=,command=`: the session ids
+    that running claude processes name (--resume or --session-id), and the start
+    times (unix seconds) of the desktop app's chat processes that name none.
+    A brand-new chat is one of those until the app restarts its process."""
+    ids, starts = set(), []
+    for line in text.splitlines():
+        m = PS_RE.match(line)
+        if not m or not CLAUDE_COMMAND_RE.search(m.group(5)):
+            continue
+        days, hours, minutes, seconds, command = m.groups()
+        named = SESSION_FLAG_RE.findall(command)
+        ids.update(named)
+        if not named and "/claude-code/" in command and "--input-format" in command:
+            elapsed = ((int(days or 0) * 24 + int(hours or 0)) * 60 + int(minutes)) * 60 + int(seconds)
+            starts.append(now - elapsed)
+    return ids, starts
+
+
+def running_chats():
+    """Which chats have a claude process right now, as parse_ps gives them. None
+    when ps cannot say. $CLAUDE_FAILOVER_RUNNING_CHATS decides in tests: session
+    ids separated by commas, empty for none."""
+    env = os.environ.get("CLAUDE_FAILOVER_RUNNING_CHATS")
+    if env is not None:
+        return {s for s in env.split(",") if s}, []
+    try:
+        out = subprocess.run(["/bin/ps", "-axo", "etime=,command="], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return parse_ps(out.stdout.decode("utf-8", "replace"), time.time())
+
+
+def transcript_paths(cfg):
+    """{session id: path of its transcript} for the shared projects folder, from
+    one listing. {} if the folder cannot be read."""
+    paths = {}
+    try:
+        with os.scandir(str(projects_folder(cfg))) as it:
+            subdirs = [e.path for e in it if e.is_dir()]
+    except OSError:
+        return paths
+    for d in subdirs:
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    if e.name.endswith(".jsonl") and e.is_file():
+                        paths[e.name[:-len(".jsonl")]] = e.path
+        except OSError:
+            continue
+    return paths
+
+
+def read_tail(path, nbytes):
+    """(entries, whole): the JSON objects in the last `nbytes` of a transcript, in
+    file order, and whether that was the whole file. A first line cut in half is
+    dropped, and so is any line that is not JSON."""
+    with open(str(path), "rb") as f:
+        size = os.fstat(f.fileno()).st_size
+        f.seek(max(0, size - nbytes))
+        data = f.read(nbytes)
+    lines = data.split(b"\n")
+    if size > nbytes:
+        lines = lines[1:]
+    entries = []
+    for line in lines:
+        if line.strip():
+            try:
+                entries.append(json.loads(line))
+            except (ValueError, RecursionError):
+                pass
+    return entries, size <= nbytes
+
+
+def chat_state(path):
+    """How a transcript ends (desktop_handover.tail_state). One big tool result
+    can fill the first read, so a tail with no conversation entry is read again,
+    four times as far back."""
+    nbytes = TAIL_BYTES
+    while True:
+        entries, whole = read_tail(path, nbytes)
+        state = desktop_handover.tail_state(entries)
+        if state["state"] != desktop_handover.UNKNOWN or whole or nbytes >= TAIL_MAX_BYTES:
+            return state
+        nbytes *= 4
+
+
+def one_line(text, limit):
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[:limit - 3].rstrip() + "..."
+
+
+def handover(cfg, hours=HANDOVER_HOURS):
+    """The chats that were left in the middle of their work in the last `hours`,
+    newest first, the ones that need a push before the ones that wait for the
+    person. It only reads: chat records, the ends of transcripts and the process
+    list. Returns {"hours", "note", "chats": [{"session", "cli_session", "title",
+    "state", "at", "detail", "cwd", "scheduled_task"}]} where state is
+      cut_off  it stopped in the middle of a turn and no process runs it any more
+      failed   its turn ended with an error message ("why": limit, auth or error)
+      waiting  its turn ended and it needs something from the person"""
+    now = time.time()
+    oldest = now - hours * 3600
+    out = {"hours": hours, "note": None, "chats": []}
+    folders, _skipped = resolve_folders(cfg, desktop_dir(cfg))
+    newest = {}   # chat id -> its freshest record over every account folder
+    for f in folders:
+        try:
+            with os.scandir(str(f["path"])) as it:
+                names = [e.name for e in it
+                         if e.name.startswith("local_") and e.name.endswith(".json")
+                         and e.stat(follow_symlinks=False).st_mtime >= oldest]
+        except OSError:
+            continue
+        for name in names:
+            sid = name[len("local_"):-len(".json")]
+            try:
+                _raw, record, _st = load_record(f["path"] / name, sid)
+            except (Unsafe, Invalid, OSError):
+                continue
+            if sid not in newest or activity(record) > activity(newest[sid]):
+                newest[sid] = record
+    running = running_chats()
+    if running is None:
+        out["note"] = "could not check which chats are still running, so none is listed as cut off"
+    paths = transcript_paths(cfg)
+    found = []
+    for sid, record in newest.items():
+        if record.get("isArchived") is True:
+            continue
+        cli_id = record.get("cliSessionId")
+        cli_id = cli_id if isinstance(cli_id, str) and cli_id else sid
+        path = paths.get(cli_id)
+        if path is None:
+            continue
+        try:
+            st = os.stat(path)
+            if st.st_mtime < oldest:
+                continue
+            tail = chat_state(path)
+        except OSError:
+            continue
+        state, detail, why_failed = None, tail["detail"], None
+        if tail["state"] == desktop_handover.CUT_OFF:
+            born = getattr(st, "st_birthtime", None)
+            if running is not None and not desktop_handover.is_alive(cli_id, born, running):
+                state = "cut_off"
+        elif tail["state"] == desktop_handover.FAILED:
+            state, why_failed = "failed", cf.classify(1, detail, "").get("kind", "error")
+        elif tail["state"] == desktop_handover.DONE:
+            detail = desktop_handover.waiting_on_person(record)
+            state = "waiting" if detail else None
+        if state is None:
+            continue
+        at = cf.parse_iso(tail["at"]) or dt.datetime.fromtimestamp(st.st_mtime, cf.LOCAL_TZ)
+        title = record.get("title")
+        task = record.get("scheduledTaskId")
+        found.append({"session": "local_" + sid, "cli_session": cli_id,
+                      "title": one_line(title, 70) if isinstance(title, str) and title.strip()
+                      else "(no title)",
+                      "state": state, "why": why_failed, "at": cf.iso(at.astimezone(cf.LOCAL_TZ)),
+                      "detail": one_line(detail, 160),
+                      "cwd": record.get("cwd") if isinstance(record.get("cwd"), str) else None,
+                      "scheduled_task": task if isinstance(task, str) and task else None,
+                      "_when": at.timestamp()})
+    found.sort(key=lambda c: (c["state"] == "waiting", -c["_when"]))
+    for chat in found:
+        del chat["_when"]
+    out["chats"] = found
+    return out
+
+
+def clock(stamp):
+    """An ISO time as "1:03 AM" when it is today, else "Nov 22, 11:40 PM"."""
+    at = cf.parse_iso(stamp)
+    if at is None:
+        return "?"
+    at = at.astimezone(cf.LOCAL_TZ)
+    hour = "%d:%02d %s" % (at.hour % 12 or 12, at.minute, "AM" if at.hour < 12 else "PM")
+    return hour if at.date() == cf.now_local().date() else "%s, %s" % (at.strftime("%b %-d"), hour)
+
+
+def chat_line(chat):
+    """One chat of the hand-over list, as text."""
+    text = chat["title"]
+    if chat["scheduled_task"]:
+        text += " [scheduled run of %s]" % chat["scheduled_task"]
+    if chat["state"] == "cut_off":
+        text += " - cut off mid-turn at %s" % clock(chat["at"])
+        if chat["detail"]:
+            text += " (last step: %s)" % one_line(chat["detail"], 70)
+    elif chat["state"] == "failed":
+        how = {"limit": "stopped at a usage limit", "auth": "stopped because the login ended"}.get(
+            chat["why"], "stopped by an error")
+        text += " - %s at %s" % (how, clock(chat["at"]))
+        if chat["detail"]:
+            text += ": %s" % one_line(chat["detail"], 80)
+    else:
+        text += " - waits for you since %s: %s" % (clock(chat["at"]), one_line(chat["detail"], 90))
+    return text
+
+
+def handover_lines(cfg):
+    """The hand-over list as short text lines, the chats that need a push first.
+    For `claude-accounts switch`, which prints them after a switch. It only
+    reads, and never raises."""
+    try:
+        h = handover(cfg)
+        lines = [chat_line(c) for c in h["chats"]]
+        return lines + ([h["note"]] if h["note"] else [])
+    except Exception:
+        return []
+
+
+def handover_status_lines(cfg):
+    """For `sync status`: how many chats are there to pick up. Never raises."""
+    try:
+        chats = handover(cfg)["chats"]
+    except Exception:
+        return []
+    stopped = sum(1 for c in chats if c["state"] != "waiting")
+    waiting = len(chats) - stopped
+    if not stopped and not waiting:
+        return []
+    parts = []
+    if stopped:
+        parts.append("%s stopped in the middle of %s work" % (plural(stopped, "chat"),
+                                                             "its" if stopped == 1 else "their"))
+    if waiting:
+        parts.append("%s for you" % plural(waiting, "chat waits", "chats wait"))
+    return ["  to pick up - %s (claude-accounts sync handover)" % ", ".join(parts)]
+
+
+def cmd_handover(cfg, args):
+    args = list(args)
+    hours = _pop_option(args, "--hours")
+    as_json = "--json" in args
+    if any(a != "--json" for a in args) or hours == "" or (hours is not None and not hours.isdigit()):
+        print(USAGE)
+        return 2
+    h = handover(cfg, int(hours) if hours else HANDOVER_HOURS)
+    if as_json:
+        print(json.dumps(h, indent=2))
+        return 0
+    lines = ["Chats to pick up (active in the last %s)" % plural(h["hours"], "hour")]
+    groups = (("cut_off", "cut off mid-turn - the app was signed out or quit; they do not go on "
+                          "by themselves"),
+              ("failed", "stopped by a usage limit or an error"),
+              ("waiting", "waiting for you"))
+    for state, head in groups:
+        chats = [c for c in h["chats"] if c["state"] == state]
+        if chats:
+            lines.append("  %s" % head)
+            for c in chats:
+                lines.append("    %s" % chat_line(c))
+                lines.append("      %s" % c["session"])
+    if h["note"]:
+        lines.append("  note - %s" % h["note"])
+    if not h["chats"]:
+        lines.append("  nothing - no chat was left in the middle of its work")
+    elif any(c["state"] != "waiting" for c in h["chats"]):
+        lines.append('  to go on - open the chat and say "continue". A chat in the app can send '
+                     "that to another chat for you.")
+    print("\n".join(lines))
+    return 0
 
 
 # --------------------------------------------------------------------------
@@ -1259,7 +1735,7 @@ def new_report(dry_run):
     for key in COUNTS:
         report[key] = 0
     report.update({"errors": [], "backup": None, "inactive_scheduled_tasks": [],
-                   "scheduled_tasks": None, "by_pair": [], "actions": [],
+                   "scheduled_tasks": None, "backlog": None, "by_pair": [], "actions": [],
                    "actions_truncated": False})
     return report
 
@@ -1330,6 +1806,12 @@ def _run(cfg, sdir, dry_run):
         tasks = {"on": tasks_on(cfg), "source": None, "tasks": 0, "note": why(e), "targets": []}
         report["errors"].append("the scheduled tasks were not copied: %s" % why(e))
     report["scheduled_tasks"] = tasks
+    try:
+        report["backlog"] = mirror_backlog(cfg, resolved, active, sdir, dry_run, report["errors"])
+    except Exception as e:   # like the tasks: never in the way of the chats
+        report["backlog"] = {"on": backlog_on(cfg), "source": None, "items": 0, "note": why(e),
+                             "targets": []}
+        report["errors"].append("the task backlog was not copied: %s" % why(e))
     # Once the lists are mirrored, the task lines say what only another account has.
     report["inactive_scheduled_tasks"] = ([] if tasks["source"]
                                           else inactive_tasks(folders, active))
@@ -1389,6 +1871,10 @@ def _save_last(sdir, report):
         if row["written"] and news:
             cf.log_event("desktop_task_sync", account=row["account"], added=news.count("add"),
                          updated=news.count("update"), marked_run=news.count("mark_run"))
+    for row in (report.get("backlog") or {}).get("targets", []):
+        if row["written"]:
+            cf.log_event("desktop_backlog_sync", account=row["account"], added=len(row["added"]),
+                         removed=len(row["removed"]))
 
 
 def sync_quietly(cfg):
@@ -1485,6 +1971,7 @@ def report_lines(r):
             and not r["deleted_elsewhere_live"]:
         lines.append("  in sync - nothing to copy")
     lines.extend(task_lines(r))
+    lines.extend(backlog_lines(r))
     for e in r["errors"]:
         lines.append("  error - %s" % e)
     return lines
@@ -1594,6 +2081,8 @@ def cli(cfg, argv):
         return 0
     if sub == "install":
         return cmd_install(cfg, args[1:])
+    if sub == "handover":
+        return cmd_handover(cfg, args[1:])
     if sub in ("uninstall", "status"):
         if len(args) != 1:
             print(USAGE)
@@ -1818,6 +2307,8 @@ def cmd_status(cfg):
     else:
         lines.append("  last sync - never")
     lines.extend(task_status_lines(cfg))
+    lines.extend(backlog_status_lines(cfg))
+    lines.extend(handover_status_lines(cfg))
     lines.append("  log - %s" % tilde(sync_dir() / "agent.log"))
     print("\n".join(lines))
     return rc

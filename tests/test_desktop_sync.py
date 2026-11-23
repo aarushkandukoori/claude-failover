@@ -101,6 +101,7 @@ class Base(unittest.TestCase):
             "CLAUDE_FAILOVER_STATE_DIR": str(self.state),
             "CLAUDE_FAILOVER_DESKTOP_DIR": str(self.desktop),
             "CLAUDE_FAILOVER_APP_RUNNING": "0",
+            "CLAUDE_FAILOVER_RUNNING_CHATS": "",   # no chat has a process (never ask the real ps)
             "CLAUDE_FAILOVER_LAUNCHCTL": "0",
             "CLAUDE_FAILOVER_LAUNCH_AGENTS_DIR": str(self.agents),
             "CLAUDE_FAILOVER_NO_NOTIFY": "1",
@@ -1659,6 +1660,507 @@ class TwoFoldersOneAccountTasksTest(TasksBase):
         self.assertEqual(r["scheduled_tasks"]["note"],
                          "the signed-in account has more than one chat folder in the config")
         self.assertEqual(r["scheduled_tasks"]["targets"], [])
+
+
+def later(name, age_days=1, **more):
+    """A task backlog item shaped like the app's, proposed `age_days` ago."""
+    made = int(time.time() * 1000) - int(age_days * 86400 * 1000)
+    data = {"id": "todo_%s" % hashlib.sha256(name.encode()).hexdigest()[:12], "cwd": "/tmp/proj",
+            "source": "dismissed", "title": "Later %s" % name, "tldr": "short", "prompt": "do %s" % name,
+            "suggestedAt": made, "filedAt": made + 5,
+            "originSessionId": "local_chat-%s" % name, "originTaskId": "task_%s" % name}
+    data.update(more)
+    return data
+
+
+class BacklogTest(TasksBase):
+    """The signed-in account's task backlog is mirrored into the other account's file."""
+
+    def backlog_path(self, account):
+        return self.dirs[account] / "backlog" / "tasks.json"
+
+    def put_backlog(self, account, items, mode=0o600, **top):
+        """Write an account's backlog the way the app does: JSON on one line."""
+        doc = {"version": 1, "items": items}
+        doc.update(top)
+        path = self.backlog_path(account)
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(json.dumps(doc, separators=(",", ":")))
+        os.chmod(str(path), mode)
+        return path
+
+    def titles(self, account):
+        return [i["title"] for i in json.loads(self.backlog_path(account).read_text())["items"]]
+
+    def brow(self, report, account="work"):
+        rows = [t for t in report["backlog"]["targets"] if t["account"] == account]
+        self.assertEqual(len(rows), 1)
+        return rows[0]
+
+    def backlog_backups(self, acct=W_ACCT, org=W_ORG):
+        d = self.state / "desktop-sync" / "task-backups" / acct / org
+        return sorted(p for p in d.iterdir() if p.name.startswith("backlog.")) if d.is_dir() else []
+
+    def test_items_reach_the_other_account(self):
+        a, b = later("a"), later("b", title="Café fix")
+        self.put_backlog("personal", [a, b, later("stale", age_days=40)])
+        own = later("own")
+        target = self.put_backlog("work", [own, a], mode=0o640, somethingNew={"kept": True})
+        original = target.read_bytes()
+        self.sign_in(P_ACCT)
+        before = snapshot(self.dirs["personal"])
+        r = self.sync()
+        self.assertEqual(r["errors"], [])
+        self.assertEqual(snapshot(self.dirs["personal"]), before)      # the signed-in list is only read
+        doc = json.loads(target.read_text())
+        self.assertEqual(doc, {"version": 1, "items": [own, a, b], "somethingNew": {"kept": True}})
+        self.assertEqual(target.read_bytes(),
+                         json.dumps(doc, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+        st = os.stat(str(target))
+        self.assertEqual((stat.S_IMODE(st.st_mode), st.st_nlink), (0o640, 1))
+        row = self.brow(r)
+        self.assertEqual((row["added"], row["removed"], row["only_there"], row["written"], row["note"]),
+                         (["Café fix"], [], 1, True, None))
+        self.assertEqual((r["backlog"]["source"], r["backlog"]["items"]), ("personal", 3))
+        backups = self.backlog_backups()
+        self.assertEqual((len(backups), backups[0].read_bytes(), row["backup"]),
+                         (1, original, str(backups[0])))
+        lines = ds.report_lines(r)
+        self.assertIn("Task backlog (copied from personal, the signed-in account)", lines)
+        self.assertIn("  work: 1 added", lines)
+        self.assertIn("    add - Café fix", lines)
+        self.no_temp_files()
+        events = [json.loads(line) for line in (self.state / "events.jsonl").read_text().splitlines()]
+        self.assertEqual([(e["account"], e["added"], e["removed"]) for e in events
+                          if e["event"] == "desktop_backlog_sync"], [("work", 1, 0)])
+        # A second run finds nothing to do and says nothing.
+        snap = snapshot(self.sessions)
+        again = self.sync()
+        self.assertEqual(snapshot(self.sessions), snap)
+        self.assertEqual((self.brow(again)["added"], self.brow(again)["written"]), ([], False))
+        self.assertFalse([line for line in ds.report_lines(again) if "backlog" in line.lower()])
+
+    def test_item_started_here_leaves_the_other_account_too(self):
+        self.put_backlog("personal", [later("a"), later("b")])
+        self.put_backlog("work", [later("own")])
+        self.sign_in(P_ACCT)
+        self.sync()
+        self.assertEqual(self.titles("work"), ["Later own", "Later a", "Later b"])
+        # The task is started under the signed-in account: the app takes it off that list.
+        self.put_backlog("personal", [later("b")])
+        r = self.sync()
+        self.assertEqual(self.titles("work"), ["Later own", "Later b"])
+        row = self.brow(r)
+        self.assertEqual((row["added"], row["removed"], row["only_there"]), ([], ["Later a"], 1))
+        lines = ds.report_lines(r)
+        self.assertIn("  work: 1 removed", lines)
+        self.assertIn("    remove - Later a (started or dropped on personal)", lines)
+        self.assertEqual(self.brow(self.sync())["removed"], [])
+
+    def test_the_first_sync_removes_nothing(self):
+        self.put_backlog("personal", [later("a")])
+        self.put_backlog("work", [later("own"), later("other")])
+        self.sign_in(P_ACCT)
+        r = self.sync()
+        self.assertEqual(self.titles("work"), ["Later own", "Later other", "Later a"])
+        self.assertEqual(self.brow(r)["removed"], [])
+
+    def test_a_missing_list_here_copies_and_removes_nothing(self):
+        self.put_backlog("personal", [later("a")])
+        self.put_backlog("work", [])
+        self.sign_in(P_ACCT)
+        self.sync()
+        self.assertEqual(self.titles("work"), ["Later a"])
+        os.unlink(str(self.backlog_path("personal")))     # not an empty list: no list at all
+        before = snapshot(self.sessions)
+        r = self.sync()
+        self.assertEqual(snapshot(self.sessions), before)
+        self.assertEqual((r["backlog"]["source"], r["backlog"]["targets"], r["errors"]), (None, [], []))
+
+    def test_after_a_switch_the_other_account_leads(self):
+        self.put_backlog("personal", [later("a"), later("b")])
+        self.sign_in(P_ACCT)
+        self.sync()
+        self.assertEqual(self.titles("work"), ["Later a", "Later b"])
+        self.sign_in(W_ACCT)
+        self.assertEqual(self.brow(self.sync(), "personal")["removed"], [])     # nothing changed yet
+        # Started on the account the app is on now, and one new item filed there.
+        self.put_backlog("work", [later("b"), later("c")])
+        before = snapshot(self.dirs["work"])
+        r = self.sync()
+        self.assertEqual(snapshot(self.dirs["work"]), before)
+        self.assertEqual(self.titles("personal"), ["Later b", "Later c"])
+        row = self.brow(r, "personal")
+        self.assertEqual((row["added"], row["removed"]), (["Later c"], ["Later a"]))
+
+    def test_account_without_a_backlog_gets_one(self):
+        a = later("a")
+        self.put_backlog("personal", [a])
+        self.sign_in(P_ACCT)
+        r = self.sync()
+        target = self.backlog_path("work")
+        self.assertEqual(json.loads(target.read_text()), {"version": 1, "items": [a]})
+        self.assertEqual(stat.S_IMODE(os.stat(str(target)).st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(os.stat(str(target.parent)).st_mode), 0o700)
+        self.assertEqual((self.brow(r)["written"], self.brow(r)["backup"]), (True, None))
+        self.assertEqual(self.backlog_backups(), [])
+
+    def test_dry_run_and_status(self):
+        self.put_backlog("personal", [later("a"), later("b")])
+        self.put_backlog("work", [later("a"), later("own")])
+        self.sign_in(P_ACCT)
+        before = snapshot(self.tmp)
+        rc, out = self.run_cli("--dry-run")
+        self.assertEqual((rc, snapshot(self.tmp)), (0, before))
+        self.assertFalse(self.state.exists())
+        lines = out.splitlines()
+        self.assertIn("Task backlog (copied from personal, the signed-in account) - dry run, "
+                      "nothing written", lines)
+        self.assertIn("  work: 1 to add", lines)
+        self.assertIn("    add - Later b", lines)
+        rc, out = self.run_cli("status")
+        self.assertEqual(snapshot(self.tmp), before)
+        self.assertIn("  task backlog - work is 1 change behind personal (signed in), the next sync "
+                      "copies it", out.splitlines())
+        self.sync()
+        rc, out = self.run_cli("status")
+        self.assertIn("  task backlog - work matches personal (signed in, 2 items), plus 1 item only "
+                      "on work", out.splitlines())
+
+    def test_lists_this_tool_does_not_understand_are_left_alone(self):
+        self.put_backlog("personal", [later("a")])
+        self.sign_in(P_ACCT)
+        target = self.backlog_path("work")
+        target.parent.mkdir()
+        for text, why in (('{"version":2,"items":[]}', "a newer format (version 2)"),
+                          ("{ half a file", "not JSON"),
+                          ('{"version":1,"items":["x"]}', "an entry that is not an item")):
+            target.write_text(text)
+            before = snapshot(self.tmp / "desktop")
+            r = self.sync()
+            self.assertEqual(snapshot(self.tmp / "desktop"), before, text)
+            row = self.brow(r)
+            self.assertEqual((row["note"], row["written"], r["errors"]),
+                             ("its backlog cannot be read (%s)" % why, False, []))
+            self.assertIn("  work: left alone - %s" % row["note"], ds.report_lines(r))
+        # A signed-in list in a newer format: nothing is copied anywhere.
+        self.put_backlog("work", [later("own")])
+        self.put_backlog("personal", [later("a")], version=2)
+        before = snapshot(self.sessions)
+        r = self.sync()
+        self.assertEqual(snapshot(self.sessions), before)
+        self.assertEqual(r["backlog"]["note"],
+                         "cannot read the backlog of personal (a newer format (version 2))")
+        self.assertIn("Task backlog - not copied: %s" % r["backlog"]["note"], ds.report_lines(r))
+
+    def test_config_can_turn_the_copying_off(self):
+        self.cfg["desktop_sync"]["backlog"] = False
+        self.put_backlog("personal", [later("a")])
+        self.put_backlog("work", [])
+        self.sign_in(P_ACCT)
+        before = snapshot(self.sessions)
+        r = self.sync()
+        self.assertEqual(snapshot(self.sessions), before)
+        self.assertEqual((r["backlog"]["on"], r["backlog"]["targets"]), (False, []))
+        self.assertFalse([line for line in ds.report_lines(r) if "acklog" in line])
+        rc, out = self.run_cli("status")
+        self.assertIn("  task backlog - not copied (desktop_sync.backlog is false in the config)",
+                      out.splitlines())
+
+    def test_a_list_that_changes_during_the_sync_is_not_overwritten(self):
+        self.put_backlog("personal", [later("a")])
+        self.put_backlog("work", [later("own")])
+        self.sign_in(P_ACCT)
+        real_backup = ds.backup_tasks
+
+        def app_writes_meanwhile(*args):
+            path = real_backup(*args)
+            self.put_backlog("work", [later("own"), later("just-filed")])
+            return path
+
+        with mock.patch.object(ds, "backup_tasks", side_effect=app_writes_meanwhile):
+            r = self.sync()
+        self.assertEqual(self.titles("work"), ["Later own", "Later just-filed"])
+        self.assertEqual((self.brow(r)["written"], r["errors"]), (False, []))
+        self.assertEqual(self.brow(r)["note"], "its backlog changed during the sync (the next run "
+                                               "catches up)")
+        self.sync()
+        self.assertEqual(self.titles("work"), ["Later own", "Later just-filed", "Later a"])
+
+    def test_backlog_and_task_backups_are_pruned_separately(self):
+        d = self.state / "desktop-sync" / "task-backups" / W_ACCT / W_ORG
+        d.mkdir(parents=True)
+        now = dt.datetime(2026, 11, 22, 12, 0, 0, tzinfo=dt.timezone.utc)
+        old = ["%s.202609%02d-080000.json" % (kind, day) for kind in ("scheduled-tasks", "backlog")
+               for day in range(1, 8)]
+        for name in old:
+            (d / name).write_text("{}")
+        self.assertEqual(ds.prune_task_backups(self.state / "desktop-sync", now), 4)
+        left = sorted(p.name for p in d.iterdir())
+        self.assertEqual(left, sorted("%s.202609%02d-080000.json" % (kind, day)
+                                      for kind in ("scheduled-tasks", "backlog") for day in range(3, 8)))
+
+    def test_a_bug_in_the_backlog_step_does_not_stop_the_chats(self):
+        self.record("personal", "s1")
+        self.sign_in(P_ACCT)
+        with mock.patch.object(ds, "mirror_backlog", side_effect=RuntimeError("boom")):
+            r = self.sync()
+        self.assertTrue(self.has("work", "s1"))
+        self.assertEqual(r["errors"], ["the task backlog was not copied: boom"])
+
+
+def said(text, at, **more):
+    """A transcript entry: the person's prompt."""
+    return dict({"type": "user", "timestamp": at, "message": {"role": "user", "content": text}}, **more)
+
+
+def answered(text, at, stop="end_turn", **more):
+    """A transcript entry: a reply that ends the turn."""
+    return dict({"type": "assistant", "timestamp": at, "uuid": "u-" + at,
+                 "message": {"role": "assistant", "stop_reason": stop,
+                             "content": [{"type": "text", "text": text}]}}, **more)
+
+
+def called(tool, description, at):
+    """A transcript entry: a tool call."""
+    return {"type": "assistant", "timestamp": at,
+            "message": {"role": "assistant", "stop_reason": "tool_use", "content": [
+                {"type": "tool_use", "id": "t1", "name": tool, "input": {"description": description}}]}}
+
+
+def returned(text, at):
+    """A transcript entry: what the tool gave back."""
+    return {"type": "user", "timestamp": at, "message": {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "t1", "content": text}]}}
+
+
+class HandoverTest(Base):
+    """`claude-accounts sync handover`: the chats that were left in the middle of their work."""
+    A, B, C = "2026-11-23T05:26:01.000Z", "2026-11-23T05:26:20.000Z", "2026-11-23T05:26:23.000Z"
+
+    def chat(self, sid, entries, account="personal", **fields):
+        """A chat record plus its transcript."""
+        self.record(account, sid, transcript=False, **fields)
+        path = self.project / ("cli-%s.jsonl" % sid)
+        path.write_text("".join(json.dumps(e) + "\n" for e in entries))
+        return path
+
+    def cut_off(self, sid, **fields):
+        return self.chat(sid, [said("go", self.A), called("Bash", "Run the build", self.B),
+                               returned("Exit code 137", self.C)], **fields)
+
+    def done(self, sid, **fields):
+        return self.chat(sid, [said("go", self.A), answered("Finished.", self.C)], **fields)
+
+    def states(self, **kw):
+        return [(c["session"], c["state"]) for c in ds.handover(self.cfg, **kw)["chats"]]
+
+    def test_cut_off_chat_is_listed_and_a_running_one_is_not(self):
+        self.cut_off("killed", title="Killed by the sign-out")
+        self.cut_off("alive", title="Still working")
+        self.done("finished")
+        os.environ["CLAUDE_FAILOVER_RUNNING_CHATS"] = "cli-alive,cli-somebody-else"
+        before = snapshot(self.tmp)
+        h = ds.handover(self.cfg)
+        self.assertEqual(snapshot(self.tmp), before)          # it only reads
+        self.assertFalse(self.state.exists())
+        self.assertEqual((h["hours"], h["note"]), (48, None))
+        self.assertEqual(h["chats"], [{
+            "session": "local_killed", "cli_session": "cli-killed", "title": "Killed by the sign-out",
+            "state": "cut_off", "why": None, "at": cf.iso(cf.parse_iso(self.C).astimezone(cf.LOCAL_TZ)),
+            "detail": "Bash - Run the build", "cwd": "/tmp/proj", "scheduled_task": None}])
+        self.assertEqual(ds.handover_lines(self.cfg), [
+            "Killed by the sign-out - cut off mid-turn at %s (last step: Bash - Run the build)"
+            % ds.clock(self.C)])
+        # Once its process is gone, the other one is cut off too.
+        os.environ["CLAUDE_FAILOVER_RUNNING_CHATS"] = ""
+        self.assertEqual(sorted(self.states()), [("local_alive", "cut_off"), ("local_killed", "cut_off")])
+
+    def test_finished_chat_is_listed_only_when_it_waits_for_you(self):
+        self.done("plain")
+        self.done("blocked", title="Needs a name", lastAssistantUuid="u1", postTurnSummaryFor="u1",
+                  postTurnSummary={"status_category": "blocked", "needs_action": "A or B?"})
+        self.done("old-note", lastAssistantUuid="u2", postTurnSummaryFor="u1",
+                  postTurnSummary={"status_category": "blocked", "needs_action": "from an older turn"})
+        self.done("fine", lastAssistantUuid="u1", postTurnSummaryFor="u1",
+                  postTurnSummary={"status_category": "completed", "needs_action": ""})
+        chats = ds.handover(self.cfg)["chats"]
+        self.assertEqual([(c["session"], c["state"], c["detail"]) for c in chats],
+                         [("local_blocked", "waiting", "A or B?")])
+        self.assertEqual(ds.handover_lines(self.cfg),
+                         ["Needs a name - waits for you since %s: A or B?" % ds.clock(self.C)])
+
+    def test_turn_that_ended_at_a_usage_limit(self):
+        limit = answered("You've hit your weekly limit · resets Sat 11pm", self.C,
+                         stop="stop_sequence", isApiErrorMessage=True)
+        self.chat("out", [said("go", self.A), limit], title="Ran out")
+        other = answered("API Error: 529 Overloaded", self.C, stop="stop_sequence", isApiErrorMessage=True)
+        self.chat("err", [said("go", self.A), other], title="Server trouble")
+        os.environ["CLAUDE_FAILOVER_RUNNING_CHATS"] = "cli-out"       # an idle process changes nothing
+        chats = {c["session"]: c for c in ds.handover(self.cfg)["chats"]}
+        self.assertEqual((chats["local_out"]["state"], chats["local_out"]["why"]), ("failed", "limit"))
+        self.assertEqual((chats["local_err"]["state"], chats["local_err"]["why"]), ("failed", "error"))
+        lines = ds.handover_lines(self.cfg)
+        self.assertIn("Ran out - stopped at a usage limit at %s: You've hit your weekly limit · "
+                      "resets Sat 11pm" % ds.clock(self.C), lines)
+        self.assertIn("Server trouble - stopped by an error at %s: API Error: 529 Overloaded"
+                      % ds.clock(self.C), lines)
+
+    def test_stopped_archived_and_old_chats_are_left_out(self):
+        self.chat("stopped", [said("go", self.A), called("Bash", "x", self.B), returned("...", self.B),
+                              said("[Request interrupted by user]", self.C)])
+        self.cut_off("archived", isArchived=True)
+        old = self.cut_off("old")
+        long_ago = time.time() - 50 * 3600
+        os.utime(str(old), (long_ago, long_ago))
+        self.record("personal", "no-transcript", transcript=False)
+        (self.project / "cli-not-a-chat.jsonl").write_text(json.dumps(returned("x", self.C)) + "\n")
+        self.assertEqual(self.states(), [])
+        self.assertEqual(self.states(hours=72), [("local_old", "cut_off")])
+        # A record nobody touched for longer than that is not even opened.
+        os.utime(str(self.path("personal", "old")), (long_ago, long_ago))
+        real, opened = ds.chat_state, []
+        with mock.patch.object(ds, "chat_state", side_effect=lambda p: opened.append(Path(p).name)
+                               or real(p)):
+            self.assertEqual(self.states(hours=72), [("local_old", "cut_off")])
+            self.assertIn("cli-old.jsonl", opened)
+            del opened[:]
+            self.assertEqual(self.states(), [])
+            self.assertNotIn("cli-old.jsonl", opened)
+
+    def test_order_newest_first_and_waiting_last(self):
+        self.chat("early", [said("go", self.A), returned("x", self.A)])
+        self.chat("late", [said("go", self.A), returned("x", self.C)])
+        self.chat("waits", [said("go", self.A), answered("Which one?", "2026-11-23T05:59:00.000Z")],
+                  lastAssistantUuid="u1", postTurnSummaryFor="u1",
+                  postTurnSummary={"status_category": "blocked", "needs_action": "Which one?"})
+        self.assertEqual(self.states(), [("local_late", "cut_off"), ("local_early", "cut_off"),
+                                         ("local_waits", "waiting")])
+
+    def test_freshest_record_of_a_chat_decides(self):
+        # The copy on the other account still names an older transcript.
+        self.record("work", "s1", title="old name", activity=BASE_MS, transcript=False)
+        self.record("personal", "s1", title="new name", activity=BASE_MS + 5, transcript=False,
+                    cliSessionId="cli-s1-after-clear")
+        (self.project / "cli-s1.jsonl").write_text(json.dumps(answered("done", self.A)) + "\n")
+        (self.project / "cli-s1-after-clear.jsonl").write_text(
+            json.dumps(said("go", self.A)) + "\n" + json.dumps(returned("x", self.C)) + "\n")
+        chats = ds.handover(self.cfg)["chats"]
+        self.assertEqual([(c["title"], c["cli_session"], c["state"]) for c in chats],
+                         [("new name", "cli-s1-after-clear", "cut_off")])
+
+    def test_without_a_process_list_nothing_is_called_cut_off(self):
+        self.cut_off("maybe")
+        self.done("blocked", lastAssistantUuid="u1", postTurnSummaryFor="u1",
+                  postTurnSummary={"status_category": "blocked", "needs_action": "A or B?"})
+        with mock.patch.object(ds, "running_chats", return_value=None):
+            h = ds.handover(self.cfg)
+            lines = ds.handover_lines(self.cfg)
+        self.assertEqual([(c["session"], c["state"]) for c in h["chats"]], [("local_blocked", "waiting")])
+        self.assertEqual(h["note"], "could not check which chats are still running, so none is listed "
+                                    "as cut off")
+        self.assertEqual(lines[-1], h["note"])
+
+    def test_a_big_tool_result_does_not_hide_the_end(self):
+        big = returned("x" * 5000, self.C)
+        self.chat("big", [said("go", self.A), called("Read", "Read a long file", self.B), big])
+        with mock.patch.object(ds, "TAIL_BYTES", 300):     # the first read holds half a line only
+            chats = ds.handover(self.cfg)["chats"]
+        self.assertEqual([(c["session"], c["state"], c["detail"]) for c in chats],
+                         [("local_big", "cut_off", "Read - Read a long file")])
+        path = self.project / "cli-big.jsonl"
+        entries, whole = ds.read_tail(path, 300)
+        self.assertEqual((entries, whole), ([], False))
+        entries, whole = ds.read_tail(path, 10 ** 6)
+        self.assertEqual((len(entries), whole), (3, True))
+        with open(str(path), "a") as f:
+            f.write("{ half a line")                        # the app is in the middle of a write
+        self.assertEqual(len(ds.read_tail(path, 10 ** 6)[0]), 3)
+
+    def test_ps_output_names_the_running_chats(self):
+        app = "/Users/me/Library/Application Support/Claude/claude-code/2.1.330/ab12/claude.app/Contents/MacOS/claude"
+        text = "\n".join([
+            "   04:50 %s --output-format stream-json --input-format stream-json --resume=05b040d5-324f-4fcb --verbose" % app,
+            "   15:02 %s --output-format stream-json --input-format stream-json --verbose" % app,
+            "01:00:10 /Applications/Claude.app/Contents/Helpers/disclaimer --pgroup -- %s --input-format stream-json --resume=05b040d5-324f-4fcb" % app,
+            "2-03:04:05 claude --resume 9f8e7d6c-aaaa-bbbb",
+            "   00:07 /opt/homebrew/bin/claude --session-id=11112222-3333 -p hi",
+            "   00:09 /usr/bin/python3 notes.py --resume=not-a-claude-process",
+            "   00:11 /opt/homebrew/bin/claude -p hi",
+            "garbage line",
+            ""])
+        ids, starts = ds.parse_ps(text, 100000.0)
+        self.assertEqual(ids, {"05b040d5-324f-4fcb", "9f8e7d6c-aaaa-bbbb", "11112222-3333"})
+        self.assertEqual(starts, [100000.0 - (15 * 60 + 2)])   # the app's chat that names no session
+        os.environ.pop("CLAUDE_FAILOVER_RUNNING_CHATS")
+        done = subprocess.CompletedProcess(["/bin/ps"], 0, stdout=text.encode())
+        with mock.patch.object(ds.subprocess, "run", return_value=done):
+            self.assertEqual(ds.running_chats()[0], ids)
+        with mock.patch.object(ds.subprocess, "run", side_effect=OSError("no ps")):
+            self.assertIsNone(ds.running_chats())
+        with mock.patch.object(ds.subprocess, "run",
+                               return_value=subprocess.CompletedProcess(["/bin/ps"], 1, stdout=b"")):
+            self.assertIsNone(ds.running_chats())
+
+    def test_a_new_chat_is_alive_through_its_start_time(self):
+        path = self.cut_off("fresh")
+        born = os.stat(str(path)).st_birthtime
+        with mock.patch.object(ds, "running_chats", return_value=(set(), [born + 5])):
+            self.assertEqual(self.states(), [])
+        with mock.patch.object(ds, "running_chats", return_value=(set(), [born - 3600])):
+            self.assertEqual(self.states(), [("local_fresh", "cut_off")])
+
+    def test_command_prints_the_list(self):
+        self.cut_off("killed", title="Killed by the sign-out", scheduledTaskId="nightly")
+        self.done("blocked", title="Needs a name", lastAssistantUuid="u1", postTurnSummaryFor="u1",
+                  postTurnSummary={"status_category": "blocked", "needs_action": "A or B?"})
+        rc, out = self.run_cli("handover")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.splitlines(), [
+            "Chats to pick up (active in the last 48 hours)",
+            "  cut off mid-turn - the app was signed out or quit; they do not go on by themselves",
+            "    Killed by the sign-out [scheduled run of nightly] - cut off mid-turn at %s "
+            "(last step: Bash - Run the build)" % ds.clock(self.C),
+            "      local_killed",
+            "  waiting for you",
+            "    Needs a name - waits for you since %s: A or B?" % ds.clock(self.C),
+            "      local_blocked",
+            '  to go on - open the chat and say "continue". A chat in the app can send that to '
+            "another chat for you."])
+        rc, out = self.run_cli("handover", "--json", "--hours", "2000")
+        self.assertEqual(rc, 0)
+        data = json.loads(out)
+        self.assertEqual((data["hours"], [c["session"] for c in data["chats"]]),
+                         (2000, ["local_killed", "local_blocked"]))
+        rc, out = self.run_cli("status")
+        self.assertIn("  to pick up - 1 chat stopped in the middle of its work, 1 chat waits for you "
+                      "(claude-accounts sync handover)", out.splitlines())
+        for bad in (("handover", "--hours"), ("handover", "--hours", "soon"), ("handover", "now")):
+            rc, out = self.run_cli(*bad)
+            self.assertEqual((rc, out.startswith("usage: claude-accounts sync")), (2, True), bad)
+
+    def test_nothing_to_pick_up(self):
+        self.done("finished")
+        rc, out = self.run_cli("handover")
+        self.assertEqual(out.splitlines(), ["Chats to pick up (active in the last 48 hours)",
+                                            "  nothing - no chat was left in the middle of its work"])
+        rc, out = self.run_cli("status")
+        self.assertNotIn("to pick up", out)
+        self.assertEqual(ds.handover_lines(self.cfg), [])
+
+    def test_lines_never_raise(self):
+        with mock.patch.object(ds, "handover", side_effect=RuntimeError("boom")):
+            self.assertEqual(ds.handover_lines(self.cfg), [])
+            self.assertEqual(ds.handover_status_lines(self.cfg), [])
+        self.assertEqual(ds.handover_lines({}), [])              # a config with no accounts
+
+    def test_time_is_short_today_and_dated_otherwise(self):
+        now = cf.now_local().replace(hour=13, minute=5, second=0, microsecond=0)
+        self.assertEqual(ds.clock(cf.iso(now)), "1:05 PM")
+        self.assertEqual(ds.clock(cf.iso(now.replace(hour=0, minute=9))), "12:09 AM")
+        other_day = (now - dt.timedelta(days=40)).replace(hour=23, minute=40)
+        self.assertEqual(ds.clock(cf.iso(other_day)), other_day.strftime("%b %-d") + ", 11:40 PM")
+        self.assertEqual(ds.clock("not a time"), "?")
 
 
 class AppDetectionTest(unittest.TestCase):
