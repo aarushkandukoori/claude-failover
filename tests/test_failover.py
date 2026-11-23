@@ -191,6 +191,40 @@ class ResetParseTests(unittest.TestCase):
 
 
 class ArgvTests(unittest.TestCase):
+    def test_set_option_replaces_in_place_or_appends(self):
+        self.assertEqual(cf.set_option(["-p", "hi"], "--settings", "{}"), ["-p", "hi", "--settings", "{}"])
+        self.assertEqual(cf.set_option(["-p", "--settings", "a", "hi"], "--settings", "b"),
+                         ["-p", "--settings", "b", "hi"])
+        self.assertEqual(cf.set_option(["-p", "--settings=a", "hi"], "--settings", "b"),
+                         ["-p", "--settings=b", "hi"])
+        self.assertEqual(cf.set_option(["-p", "--", "hi"], "--settings", "b"),
+                         ["-p", "--settings", "b", "--", "hi"])
+        # another option's value that looks like the option is not touched
+        self.assertEqual(cf.set_option(["--system-prompt", "--settings", "-p", "hi"], "--settings", "b"),
+                         ["--system-prompt", "--settings", "-p", "hi", "--settings", "b"])
+        self.assertEqual(cf.set_model_option(["-p", "hi", "--model", "sonnet"], "opus"),
+                         ["-p", "hi", "--model", "opus"])
+
+    def test_merge_settings_goes_one_level_deep(self):
+        base = {"ultracode": False, "env": {"A": "1", "B": "2"}, "model": "x"}
+        over = {"env": {"B": "3", "C": "4"}, "model": "y", "permissions": {"defaultMode": "auto"}}
+        self.assertEqual(cf.merge_settings(base, over), {
+            "ultracode": False, "env": {"A": "1", "B": "3", "C": "4"}, "model": "y",
+            "permissions": {"defaultMode": "auto"}})
+        self.assertEqual(base["env"], {"A": "1", "B": "2"})     # inputs are not changed
+        self.assertEqual(cf.merge_settings({"env": "text"}, {"env": {"A": "1"}}), {"env": {"A": "1"}})
+
+    def test_headless_settings_argv_never_raises(self):
+        argv = ["-p", "hi"]
+        for cfg in (None, {}, {"headless_settings": None}, {"headless_settings": "x"}, {"headless_settings": {}}):
+            self.assertIs(cf.headless_settings_argv(cfg, argv), argv)
+        cfg = {"headless_settings": {"ultracode": False}}
+        self.assertEqual(cf.headless_settings_argv(cfg, argv), ["-p", "hi", "--settings", '{"ultracode": false}'])
+        same = ["-p", "hi", "--settings", '{"ultracode": false, "x": 1}']
+        self.assertIs(cf.headless_settings_argv(cfg, same), same)      # nothing to add
+        last = ["-p", "hi", "--settings"]
+        self.assertIs(cf.headless_settings_argv(cfg, last), last)
+
     def test_positional_detection(self):
         info = cf.parse_argv(["-p", "do X", "--model", "sonnet", "--allowedTools", "Read", "Edit"])
         self.assertEqual([t for _, t in info["positionals"]], ["do X"])
@@ -321,6 +355,112 @@ class HeadlessTests(Sandbox):
         self.plan(A="ok")
         self.run_wrapper(["--version"])
         self.assertNotIn("--permission-mode", self.calls()[-1]["argv"])
+
+    JOB_SETTINGS = {"ultracode": False, "env": {"CLAUDE_CODE_EFFORT_LEVEL": "auto"}}
+
+    def set_headless_settings(self, value):
+        cfg = json.loads(self.cfg_path.read_text())
+        cfg["headless_settings"] = value
+        self.cfg_path.write_text(json.dumps(cfg))
+
+    def settings_of(self, argv):
+        self.assertEqual(sum(1 for t in argv if t.partition("=")[0] == "--settings"), 1, argv)
+        return json.loads(argv[argv.index("--settings") + 1])
+
+    def test_print_runs_get_the_configs_headless_settings(self):
+        # settings.json may ask for max effort and helper agents in chats; a
+        # scheduled job that inherits that outlives its time limit
+        self.set_headless_settings(self.JOB_SETTINGS)
+        self.plan(A="ok")
+        r = self.run_wrapper(["-p", "hi", "--allowedTools", "Read"])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        argv = self.calls()[-1]["argv"]
+        self.assertEqual(self.settings_of(argv), self.JOB_SETTINGS)
+        self.assertIn("hi", argv)
+        self.assertEqual(argv[argv.index("--allowedTools") + 1], "Read")
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "default")
+
+    def test_headless_settings_stay_before_a_terminator(self):
+        self.set_headless_settings(self.JOB_SETTINGS)
+        self.plan(A="ok")
+        self.run_wrapper(["-p", "--allowedTools", "Read", "--", "hi"])
+        argv = self.calls()[-1]["argv"]
+        self.assertLess(argv.index("--settings"), argv.index("--"))
+        self.assertEqual(argv[-1], "hi")
+
+    def test_no_headless_settings_means_no_settings_option(self):
+        self.plan(A="ok")
+        self.run_wrapper(["-p", "hi"])
+        self.assertNotIn("--settings", self.calls()[-1]["argv"])
+        for empty in ({}, None, "auto", ["x"]):
+            self.set_headless_settings(empty)
+            self.run_wrapper(["-p", "hi"])
+            self.assertNotIn("--settings", self.calls()[-1]["argv"], empty)
+
+    def test_interactive_run_gets_no_headless_settings(self):
+        self.set_headless_settings(self.JOB_SETTINGS)
+        self.plan(A="ok")
+        self.run_wrapper(["--version"])
+        self.assertNotIn("--settings", self.calls()[-1]["argv"])
+
+    def test_the_callers_own_settings_win_over_headless_settings(self):
+        self.set_headless_settings(self.JOB_SETTINGS)
+        self.plan(A="ok")
+        own = {"env": {"CLAUDE_CODE_EFFORT_LEVEL": "max", "MINE": "1"}, "model": "opus"}
+        self.run_wrapper(["-p", "hi", "--settings", json.dumps(own)])
+        got = self.settings_of(self.calls()[-1]["argv"])
+        self.assertEqual(got["env"], {"CLAUDE_CODE_EFFORT_LEVEL": "max", "MINE": "1"})
+        self.assertEqual(got["model"], "opus")
+        self.assertIs(got["ultracode"], False)      # the config's, the caller named none
+        # written as --settings=<json> it is replaced in the same spelling
+        self.run_wrapper(["-p", "hi", "--settings=" + json.dumps({"ultracode": True})])
+        argv = self.calls()[-1]["argv"]
+        inline = [t for t in argv if t.startswith("--settings=")]
+        self.assertEqual(len(inline), 1, argv)
+        got = json.loads(inline[0].partition("=")[2])
+        self.assertIs(got["ultracode"], True)
+        self.assertEqual(got["env"], {"CLAUDE_CODE_EFFORT_LEVEL": "auto"})
+
+    def test_headless_settings_merge_with_a_settings_file(self):
+        self.set_headless_settings(self.JOB_SETTINGS)
+        self.plan(A="ok")
+        path = self.tmp / "job-settings.json"
+        path.write_text(json.dumps({"permissions": {"defaultMode": "acceptEdits"}, "env": {"A": "b"}}))
+        self.run_wrapper(["-p", "hi", "--settings", str(path)])
+        argv = self.calls()[-1]["argv"]
+        got = self.settings_of(argv)
+        self.assertEqual(got["env"], {"CLAUDE_CODE_EFFORT_LEVEL": "auto", "A": "b"})
+        self.assertEqual(got["permissions"], {"defaultMode": "acceptEdits"})
+        # the mode the file asked for is still the one that is pinned
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "acceptEdits")
+
+    def test_settings_that_cannot_be_read_are_left_alone(self):
+        self.set_headless_settings(self.JOB_SETTINGS)
+        self.plan(A="ok")
+        for raw in ("/nonexistent/settings.json", "{not json", "[1, 2]"):
+            r = self.run_wrapper(["-p", "hi", "--settings", raw])
+            self.assertEqual(r.returncode, 0, r.stderr)
+            argv = self.calls()[-1]["argv"]
+            self.assertEqual(argv[argv.index("--settings") + 1], raw)
+            self.assertEqual(argv.count("--settings"), 1)
+
+    def test_headless_settings_cannot_loosen_the_permission_mode(self):
+        self.set_headless_settings({"permissions": {"defaultMode": "bypassPermissions"}})
+        self.plan(A="ok")
+        self.run_wrapper(["-p", "hi", "--allowedTools", "Read"])
+        argv = self.calls()[-1]["argv"]
+        self.assertEqual(argv.count("--permission-mode"), 1)
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "default")
+
+    def test_headless_settings_follow_the_run_to_the_next_account(self):
+        self.set_headless_settings(self.JOB_SETTINGS)
+        self.plan(A="limit", default="ok")
+        r = self.run_wrapper(["-p", "hello"])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = self.calls()
+        self.assertEqual([c["acct"] for c in calls], ["A", "default"])
+        for c in calls:
+            self.assertEqual(self.settings_of(c["argv"]), self.JOB_SETTINGS)
 
     def test_limit_fails_over_and_is_remembered(self):
         self.plan(A="limit", default="ok")

@@ -1386,30 +1386,30 @@ def bills_extra_usage(cfg, name):
         return False
 
 
-def set_model_option(argv, model):
-    """argv with the model set to `model`. A --model the caller wrote is replaced
-    where it stands (taking it out would let an option before it swallow what
-    follows, a prompt for example); when there is none, `--model model` goes at the
-    end, or right before a `--` terminator. Everything after the terminator, and
-    the value of every other one-value option, is never looked at. A --model that
+def set_option(argv, option, value):
+    """argv with the one-value option `option` set to `value`. One the caller wrote
+    is replaced where it stands (taking it out would let an option before it swallow
+    what follows, a prompt for example); when there is none, `option value` goes at
+    the end, or right before a `--` terminator. Everything after the terminator, and
+    the value of every other one-value option, is never looked at. An `option` that
     is the last word with no value is left as it is: claude rejects that itself."""
     out, i, found = [], 0, False
     while i < len(argv):
         tok = argv[i]
         if tok == "--":
             if not found:
-                out += ["--model", model]
+                out += [option, value]
                 found = True
             out += argv[i:]
             break
         name, eq, _ = tok.partition("=")
-        if name == "--model":
+        if name == option:
             found = True
             if eq:
-                out.append("--model=%s" % model)
+                out.append("%s=%s" % (option, value))
                 i += 1
             elif i + 1 < len(argv):
-                out += ["--model", model]
+                out += [option, value]
                 i += 2
             else:
                 out.append(tok)
@@ -1422,8 +1422,64 @@ def set_model_option(argv, model):
         out.append(tok)
         i += 1
     if not found:
-        out += ["--model", model]
+        out += [option, value]
     return out
+
+
+def set_model_option(argv, model):
+    """argv with the model set to `model` (see set_option for where it goes)."""
+    return set_option(argv, "--model", model)
+
+
+def merge_settings(base, over):
+    """`over` on top of `base`, one level deep: a key that both give as an object
+    ("env", "permissions") is merged key by key, anything else takes `over`'s value."""
+    out = dict(base)
+    for key, value in over.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            inner = dict(out[key])
+            inner.update(value)
+            out[key] = inner
+        else:
+            out[key] = value
+    return out
+
+
+def headless_settings_argv(cfg, argv):
+    """Every -p run gets the settings in the config's "headless_settings".
+
+    Why: settings.json holds the defaults for chats, and a costly one there (max
+    effort, helper agents on every task) reaches every scheduled job too, which can
+    then run many times longer than its time limit. "headless_settings" is a JSON
+    object of settings for -p runs only, for example
+    {"ultracode": false, "env": {"CLAUDE_CODE_EFFORT_LEVEL": "auto"}}.
+    It goes in as --settings. A --settings the caller wrote (JSON or a file) wins
+    key by key, so one job can still ask for more; the two are merged into one JSON
+    value where the caller's stood. Returns argv unchanged when the key is not set,
+    and on any doubt (a --settings that cannot be read, anything unexpected):
+    a job must never fail because of this. Never raises."""
+    try:
+        extra = cfg.get("headless_settings") if isinstance(cfg, dict) else None
+        if not isinstance(extra, dict) or not extra:
+            return argv
+        raw = opt(parse_argv(argv), "--settings")
+        if raw is None:
+            head = argv[:argv.index("--")] if "--" in argv else argv
+            if any(tok.partition("=")[0] == "--settings" for tok in head):
+                return argv     # a --settings with no value we can read: a second one could swallow a word
+            return add_opts(argv, ["--settings", json.dumps(extra, sort_keys=True)])
+        if not isinstance(raw, str) or not raw.strip():
+            return argv
+        text = raw if raw.lstrip().startswith("{") else Path(os.path.expanduser(raw)).read_text()
+        own = json.loads(text)
+        if not isinstance(own, dict):
+            return argv
+        merged = merge_settings(extra, own)
+        if merged == own:
+            return argv
+        return set_option(argv, "--settings", json.dumps(merged, sort_keys=True))
+    except Exception:
+        return argv
 
 
 def runs_paid_model(cfg, asked, model):
@@ -1522,6 +1578,12 @@ def run_headless(cfg, argv, pinned):
     pin = headless_mode(info)
     if pin:
         argv = add_opts(argv, ["--permission-mode", pin])
+        info = parse_argv(argv)
+    # The config's settings for -p runs (normal effort for jobs, say). After the
+    # pin: the mode is an explicit option by now, so nothing in them can loosen it.
+    with_settings = headless_settings_argv(cfg, argv)
+    if with_settings is not argv:
+        argv = with_settings
         info = parse_argv(argv)
     family = model_family(cfg, info)
     stdin_bytes = slurp_stdin()
