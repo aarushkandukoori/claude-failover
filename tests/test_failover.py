@@ -571,14 +571,20 @@ class HeadlessTests(Sandbox):
             self.assertEqual([c["acct"] for c in self.calls()][-1], "A")
 
     def test_all_limited(self):
+        # The weekly limit ends on the weekday 3 days from now, so it always ends after
+        # A's "3:45pm" (at most a day away). The fake's fixed "Mon 12:00am" comes before
+        # that 3:45pm every Sunday evening, and the order below would flip.
+        days = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+        env = {"FAKE_CLAUDE_WEEKLY_RESETS":
+               "%s 12:00am" % days[(dt.date.today().weekday() + 3) % 7]}
         self.plan(A="limit", default="weekly_limit")
-        r = self.run_wrapper(["-p", "hi"])
+        r = self.run_wrapper(["-p", "hi"], extra_env=env)
         self.assertEqual(r.returncode, 1)
         self.assertIn("weekly limit", r.stdout)
         # both remembered; the next call still tries both (a saved limit can be stale),
         # the one that frees up first (A: 3:45pm) first
         n = len(self.calls())
-        self.run_wrapper(["-p", "hi"])
+        self.run_wrapper(["-p", "hi"], extra_env=env)
         self.assertEqual([c["acct"] for c in self.calls()[n:]], ["A", "default"])
 
     def test_model_scoped_limit(self):
@@ -937,7 +943,10 @@ class LoginClock(Sandbox):
         self.assertIsNone(cf.parse_iso("Dec 1"))
 
     def test_login_window_prefers_a_cli_date_that_belongs_to_this_login(self):
-        rec = {"logged_in_at": "2026-11-02T00:00:00-05:00", "login_expires_at": "2026-12-01T13:59:00+00:00"}
+        def noon(month, day):
+            # Noon here: the same calendar day in whatever time zone the test runs.
+            return dt.datetime(2026, month, day, 12, 0, tzinfo=cf.LOCAL_TZ).isoformat()
+        rec = {"logged_in_at": noon(11, 2), "login_expires_at": noon(12, 1)}
         win = cf.login_window(rec)
         self.assertEqual((win["source"], win["ends"], win["earliest"], win["renew"]),
                          ("cli", dt.date(2026, 12, 1), dt.date(2026, 11, 28), dt.date(2026, 11, 23)))

@@ -63,7 +63,9 @@ if behaviour == "ok":
 if behaviour == "limit":
     finish(LIMIT, 1, True)
 if behaviour == "weekly_limit":
-    finish("You've hit your weekly limit · resets Mon 12:00am", 1, True)
+    # A test whose result depends on when this limit ends names the time itself.
+    finish("You've hit your weekly limit · resets %s"
+           % os.environ.get("FAKE_CLAUDE_WEEKLY_RESETS", "Mon 12:00am"), 1, True)
 if behaviour == "opus_limit":
     finish("You've hit your Opus limit · resets Mon 12:00am", 1, True)
 if behaviour == "work_then_limit":
