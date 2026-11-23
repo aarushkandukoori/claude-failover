@@ -310,7 +310,7 @@ class PlanTest(unittest.TestCase):
 class PickupTest(unittest.TestCase):
     """The pick-up task: the one task whose copy on the other account is kept armed."""
     BASE = {"id": "pick-up", "displayName": "Pick up", "filePath": "/tasks/pick-up/SKILL.md",
-            "cwd": "/Users/me", "permissionMode": "bypassPermissions", "permissionModeCarried": True}
+            "cwd": "/Users/me"}
 
     def plan(self, mine, theirs, want=True):
         before = copy.deepcopy((mine, theirs, self.BASE))
@@ -346,8 +346,10 @@ class PickupTest(unittest.TestCase):
 
     def test_the_signed_in_accounts_settings_travel_but_not_its_schedule(self):
         # There the task is one that is run by hand (made in the app), or one that already ran.
+        approvals = [{"toolName": "Bash", "ruleContent": "claude-accounts sync restart:*"}]
         mine = {"id": "pick-up", "displayName": "Renamed in the app", "enabled": True, "createdAt": 5,
                 "filePath": "/tasks/pick-up/SKILL.md", "cwd": "/Users/me", "permissionMode": "auto",
+                "permissionModeCarried": True, "approvedPermissions": approvals,
                 "model": "opus", "madeByClaude": True, "promptWrittenBy": ["abc"],
                 "promptFileHash": "h.h", "cronExpression": "0 9 * * *",
                 "lastRunAt": "2026-11-22T14:00:07.000Z"}
@@ -358,8 +360,16 @@ class PickupTest(unittest.TestCase):
         self.assertEqual(entry, {
             "id": "pick-up", "displayName": "Renamed in the app", "filePath": "/tasks/pick-up/SKILL.md",
             "createdAt": 5, "cwd": "/Users/me", "model": "opus", "permissionMode": "auto",
-            "permissionModeCarried": True, "madeByClaude": True, "promptWrittenBy": ["abc"],
-            "promptFileHash": "h.h", "fireAt": NOW - 1000, "enabled": True})
+            "permissionModeCarried": True, "approvedPermissions": approvals, "madeByClaude": True,
+            "promptWrittenBy": ["abc"], "promptFileHash": "h.h", "fireAt": NOW - 1000, "enabled": True})
+
+    def test_no_permission_mode_is_ever_made_up(self):
+        # Which mode a task runs in is the person's call, made in the app. A fresh
+        # entry names none, and neither does a copy of an entry that had none.
+        for mine in (None, {"id": "pick-up", "enabled": True, "madeByClaude": True}):
+            entry, _action = self.plan(mine, None)
+            for field in ("permissionMode", "permissionModeCarried", "approvedPermissions"):
+                self.assertNotIn(field, entry)
 
     def test_not_wanted_means_switched_off_never_deleted(self):
         armed = dict(self.BASE, createdAt=NOW, fireAt=NOW - 1000, enabled=True)

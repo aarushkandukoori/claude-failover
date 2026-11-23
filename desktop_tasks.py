@@ -33,9 +33,11 @@ import datetime as dt
 import json
 
 RUN_FIELDS = ("lastRunAt", "lastScheduledFor")   # what the app writes when a task runs
-# What a copy of the pick-up task keeps from an older entry. When it runs is set anew.
+# What a copy of the pick-up task keeps from an entry the app wrote: who made it, and the
+# permission mode and approvals the person gave it there. When it runs is set anew.
 PICKUP_KEEP = ("id", "displayName", "filePath", "createdAt", "cwd", "model", "permissionMode",
-               "permissionModeCarried", "madeByClaude", "promptWrittenBy", "promptFileHash")
+               "permissionModeCarried", "approvedPermissions", "madeByClaude", "promptWrittenBy",
+               "promptFileHash")
 
 
 class NotATaskList(Exception):

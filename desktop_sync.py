@@ -1498,11 +1498,12 @@ def ensure_pickup_prompt(cfg):
 
 
 def pickup_base(cfg):
-    """What a fresh entry for the pick-up task starts from."""
+    """What a fresh entry for the pick-up task starts from. It names no permission
+    mode on purpose: which mode a task runs in is the person's call, made in the
+    app. An entry the app wrote for this task brings its mode and its approvals
+    along (desktop_tasks.PICKUP_KEEP); this tool never writes any of its own."""
     return {"id": PICKUP_ID, "displayName": PICKUP_NAME, "filePath": str(pickup_prompt_path(cfg)),
-            "cwd": os.path.expanduser("~"),
-            # It messages other chats with nobody there to approve that.
-            "permissionMode": "bypassPermissions", "permissionModeCarried": True}
+            "cwd": os.path.expanduser("~")}
 
 
 def read_claims():
@@ -1692,9 +1693,10 @@ def cmd_auto_restart(cfg, args):
                 print("Could not write the pick-up task's instructions: %s" % why(e))
                 return 1
             print("From the next sync on, a task named \"%s\" waits in the task list of every "
-                  "account the app is not signed in to. It starts when the app signs in there, in "
-                  "bypass mode (nobody is there to approve its messages), and restarts the chats "
-                  "the sign-out cut off." % PICKUP_NAME)
+                  "account the app is not signed in to. It starts when the app signs in there and "
+                  "restarts the chats the sign-out cut off. It runs in the permission mode that "
+                  "task has in the app (or your default mode): in a mode that asks before a step, "
+                  "the run waits for you." % PICKUP_NAME)
         else:
             print("The next sync switches the waiting pick-up task off. Chats cut off by a switch "
                   "then wait until someone tells them to continue (claude-accounts sync handover).")

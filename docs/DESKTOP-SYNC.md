@@ -320,9 +320,13 @@ What `sync restart` hands out, and what it never does:
 
 What to know before turning it on:
 
-- The pick-up task runs in bypass mode, because nobody is there to approve its messages
-  to the other chats. Its instructions can be edited; sync writes the file only when it
-  is missing.
+- The pick-up task runs in the permission mode that task has in the app, or your default
+  mode when it has none. Sync never writes a mode into it. It copies the mode and the
+  approvals that the app stored for this task on the signed-in account, as it does for
+  every task. In a mode that asks before a step, the run stops and waits for you, so for
+  a restart with nobody there, open the task in the app once and give it a mode that
+  does not ask.
+- Its instructions can be edited; sync writes the file only when it is missing.
 - The restarted chats use the new account's usage, and they all start within minutes of
   the sign-in.
 - It rests on how the app stores and starts scheduled tasks, which is not a documented

@@ -2451,13 +2451,12 @@ class PickupTaskTest(TasksBase):
         self.assertEqual(snapshot(self.dirs["personal"]), before)     # the signed-in list is only read
         entry = self.pick("work")
         now_ms = time.time() * 1000
-        self.assertEqual({k: entry[k] for k in ("displayName", "filePath", "cwd", "permissionMode",
-                                                "permissionModeCarried", "enabled")},
-                         {"displayName": "Pick up after an account switch",
-                          "filePath": str(self.prompt()), "cwd": str(self.home),
-                          "permissionMode": "bypassPermissions", "permissionModeCarried": True,
-                          "enabled": True})
-        self.assertNotIn("lastRunAt", entry)
+        self.assertEqual(sorted(entry), ["createdAt", "cwd", "displayName", "enabled", "filePath",
+                                         "fireAt", "id"])
+        self.assertEqual((entry["displayName"], entry["filePath"], entry["cwd"], entry["enabled"]),
+                         ("Pick up after an account switch", str(self.prompt()), str(self.home), True))
+        # No permission mode: that is given in the app, never by this tool.
+        self.assertNotIn("permissionMode", entry)
         self.assertTrue(0 <= now_ms - entry["fireAt"] < 60000)        # due the moment the app reads it
         self.assertTrue(ds.desktop_tasks.is_armed(entry, now_ms))
         self.assertEqual(self.changes(r), [("arm", ds.PICKUP_ID)])
@@ -2513,6 +2512,12 @@ class PickupTaskTest(TasksBase):
         self.assertEqual((entry["displayName"], entry["madeByClaude"], entry["enabled"]),
                          ("Pick up (run me)", True, True))
         self.assertTrue(ds.desktop_tasks.is_one_time(entry))
+        self.assertNotIn("permissionMode", entry)
+        # The mode the person gives the task in the app travels with it, like any task's.
+        self.put_tasks("personal", [dict(by_hand, permissionMode="bypassPermissions"), cron_task("mail")])
+        self.put_tasks("work", [])
+        self.sync()
+        self.assertEqual(self.pick("work")["permissionMode"], "bypassPermissions")
 
     def test_off_means_switched_off_there(self):
         self.put_tasks("personal", [])
