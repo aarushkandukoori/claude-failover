@@ -326,9 +326,11 @@ What `sync restart` hands out, and what it never does:
   listed as stopped, not cut off.
 - **Never a scheduled run** (the task runs again on its schedule) and never a chat that
   waits for you: those need your answer.
-- **Not on an account that is out of usage.** When the switch helper's last usage reading
-  says an account has used up its week, the pick-up task is not armed there, and `sync
-  restart` hands out nothing while the app is signed in to it.
+- **Not on an account that is known to be out of usage.** Sync reads no usage itself. When
+  an optional module named `account_switch` is there and its last usage reading says an
+  account has used up its week, the pick-up task is not armed there, and `sync restart`
+  hands out nothing while the app is signed in to it. Without such readings the task is
+  armed on every account.
 
 What to know before turning it on:
 

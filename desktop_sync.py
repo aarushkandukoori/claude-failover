@@ -1409,7 +1409,7 @@ def chat_line(chat):
 
 def handover_lines(cfg):
     """The hand-over list as short text lines, the chats that need a push first.
-    For `claude-accounts switch`, which prints them after a switch. It only
+    For other code, such as a helper that prints them after a switch. It only
     reads, and never raises."""
     try:
         h = handover(cfg)
@@ -1508,8 +1508,9 @@ def auto_restart_on(cfg):
 
 def out_of_usage(account):
     """When the account has used up its week: the time that week starts again, as
-    text. None when it has usage left or nothing is known. The readings are the
-    switch helper's (account_switch.py), when that is there."""
+    text. None when it has usage left or nothing is known. This tool reads no
+    usage itself: the readings come from an optional module named account_switch
+    (a switch helper that is not part of this repository), when one is there."""
     try:
         import account_switch
         reading = account_switch.read_state()["usage"].get(account)
