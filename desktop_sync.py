@@ -73,6 +73,13 @@ MAX_BACKLOG_BYTES = 32 * 1024 * 1024        # the app reads no bigger backlog fi
 TASK_BACKUP_DAYS = 30
 TASK_BACKUP_KEEP = 5           # newest task-list backups kept per account, whatever their age
 HANDOVER_HOURS = 48            # `sync handover` looks at chats that were active this recently
+RESTART_HOURS = 6              # `sync restart` only restarts chats that were cut off this recently
+RESTART_RECHECK_SECONDS = 5    # it looks twice, this far apart: a chat whose process is just restarting has moved on
+RESTARTS_FILE = "restarts.json"     # which chats were claimed for a restart, and when
+EVENTS_TAIL_BYTES = 4 * 1024 * 1024  # how much of the event log is read to find Terminal handoffs
+PICKUP_ID = "pick-up-after-account-switch"     # the scheduled task that restarts cut-off chats
+PICKUP_NAME = "Pick up after an account switch"
+OUT_OF_USAGE_AT = 0.97         # a week this much used counts as used up
 TAIL_BYTES = 512 * 1024        # how much of a transcript's end is read first
 TAIL_MAX_BYTES = 32 * 1024 * 1024
 PS_RE = re.compile(r"^\s*(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)\s+(.*)$")   # [[days-]hours:]minutes:seconds command
@@ -105,6 +112,8 @@ COUNTS = ("added", "added_needs_restart", "updated", "retired", "stale_in_runnin
 USAGE = """usage: claude-accounts sync [--dry-run] [--quiet] [--json]
        claude-accounts sync install [--every MINUTES] | sync uninstall | sync status
        claude-accounts sync handover [--json] [--hours N]
+       claude-accounts sync restart [--json] [--dry-run]
+       claude-accounts sync auto-restart [on|off]
 
   sync              copy desktop app chats so every account lists every chat, and
                     copy the signed-in account's scheduled tasks to the other accounts
@@ -113,7 +122,10 @@ USAGE = """usage: claude-accounts sync [--dry-run] [--quiet] [--json]
   sync status       the background job, the last sync, and whether the
                     scheduled task lists match
   sync handover     the chats that were left in the middle of their work (cut
-                    off by a sign-out, stopped by a usage limit) or wait for you"""
+                    off by a sign-out, stopped by a usage limit) or wait for you
+  sync restart      claim the chats a sign-out cut off, each one once, and print
+                    the message to send each of them (the pick-up task runs this)
+  sync auto-restart have the app restart those chats by itself after a switch"""
 
 
 class Unsafe(Exception):
@@ -777,11 +789,32 @@ def _mirror_into(cfg, tasks, dst, now_ms, sdir, dry_run, errors):
     except (Unsafe, desktop_tasks.NotATaskList, OSError) as e:
         row["note"] = "its task list cannot be read (%s)" % why(e)
         return row
+    theirs = doc["scheduledTasks"]
     new_list, row["changes"], row["only_there"] = desktop_tasks.plan(
-        tasks, doc["scheduledTasks"], now_ms)
+        [t for t in tasks if t["id"] != PICKUP_ID], [t for t in theirs if t["id"] != PICKUP_ID],
+        now_ms)
+    # The pick-up task is the one task that is not copied as it is: see pickup_plan.
+    mine_pick = next((t for t in tasks if t["id"] == PICKUP_ID), None)
+    their_pick = next((t for t in theirs if t["id"] == PICKUP_ID), None)
+    on = auto_restart_on(cfg)
+    if on or their_pick is not None:
+        out_until = out_of_usage(dst["account"]) if on else None
+        entry, action = desktop_tasks.pickup_plan(mine_pick, their_pick, pickup_base(cfg),
+                                                  on and not out_until, now_ms)
+        if entry is not None:
+            new_list.append(entry)
+        if action:
+            when = ("when the app signs in to %s" % dst["account"] if action == "arm"
+                    else "auto-restart is off" if not on
+                    else "%s is out of usage until %s" % (dst["account"], out_until))
+            row["changes"].append({"action": action, "id": PICKUP_ID,
+                                   "name": desktop_tasks.label(entry), "schedule": when,
+                                   "fields": []})
     if not row["changes"] or dry_run:
         return row
     try:
+        if any(c["action"] == "arm" for c in row["changes"]):
+            ensure_pickup_prompt(cfg)   # a task without its prompt file cannot start
         data = desktop_tasks.encode(dict(doc, scheduledTasks=new_list))
         if desktop_tasks.parse(data)["scheduledTasks"] != new_list:
             raise ValueError("the new list does not read back as written")
@@ -821,6 +854,11 @@ def _change_text(change):
     """One planned or finished change to a task list, as text."""
     if change["action"] == "add":
         return "add - %s (%s)" % (change["name"], change["schedule"])
+    if change["action"] == "arm":
+        return "arm - %s (it restarts the chats a sign-out cut off, %s)" % (
+            change["name"], change["schedule"])
+    if change["action"] == "disarm":
+        return "disarm - %s (%s)" % (change["name"], change["schedule"])
     verb = "mark as run" if change["action"] == "mark_run" else "update"
     return "%s - %s: %s" % (verb, change["name"],
                             ", ".join(_field_text(f) for f in change["fields"]))
@@ -847,7 +885,8 @@ def task_lines(r):
         elif changes:
             done = row["written"]
             words = (("add", "added", "to add"), ("update", "updated", "to update"),
-                     ("mark_run", "marked as run", "to mark as run"))
+                     ("mark_run", "marked as run", "to mark as run"),
+                     ("arm", "armed", "to arm"), ("disarm", "disarmed", "to disarm"))
             parts = ["%d %s" % (n, past if done else todo) for action, past, todo in words
                      for n in [sum(1 for c in changes if c["action"] == action)] if n]
             lines.append("  %s: %s%s" % (who, ", ".join(parts),
@@ -1199,8 +1238,33 @@ def handover(cfg, hours=HANDOVER_HOURS):
     now = time.time()
     oldest = now - hours * 3600
     out = {"hours": hours, "note": None, "chats": []}
+    newest = recent_records(cfg, oldest)
+    claims = read_claims()
+    running = running_chats()
+    if running is None:
+        out["note"] = "could not check which chats are still running, so none is listed as cut off"
+    paths = transcript_paths(cfg)
+    found = []
+    for sid, record in newest.items():
+        chat = _handover_chat(sid, record, paths, running, oldest)
+        if chat is not None:
+            claim = claims.get(chat["session"])
+            sent = (chat["state"] == "cut_off"
+                    and desktop_handover.claim_is_live(claim, chat["at"], now))
+            chat["restart_sent"] = claim.get("claimed") if sent else None
+            found.append(chat)
+    found.sort(key=lambda c: (c["state"] == "waiting", -c["_when"]))
+    for chat in found:
+        del chat["_when"]
+    out["chats"] = found
+    return out
+
+
+def recent_records(cfg, oldest):
+    """{chat id: its freshest record over every account folder} for the chats
+    whose record file changed since `oldest` (unix seconds)."""
     folders, _skipped = resolve_folders(cfg, desktop_dir(cfg))
-    newest = {}   # chat id -> its freshest record over every account folder
+    newest = {}
     for f in folders:
         names = []
         try:
@@ -1222,54 +1286,49 @@ def handover(cfg, hours=HANDOVER_HOURS):
                 continue
             if sid not in newest or activity(record) > activity(newest[sid]):
                 newest[sid] = record
-    running = running_chats()
-    if running is None:
-        out["note"] = "could not check which chats are still running, so none is listed as cut off"
-    paths = transcript_paths(cfg)
-    found = []
-    for sid, record in newest.items():
-        if record.get("isArchived") is True:
-            continue
-        cli_id = record.get("cliSessionId")
-        cli_id = cli_id if isinstance(cli_id, str) and cli_id else sid
-        path = paths.get(cli_id)
-        if path is None:
-            continue
-        try:
-            st = os.stat(path)
-            if st.st_mtime < oldest:
-                continue
-            tail = chat_state(path)
-        except OSError:
-            continue
-        state, detail, why_failed = None, tail["detail"], None
-        if tail["state"] == desktop_handover.CUT_OFF:
-            born = getattr(st, "st_birthtime", None)
-            if running is not None and not desktop_handover.is_alive(cli_id, born, running):
-                state = "cut_off"
-        elif tail["state"] == desktop_handover.FAILED:
-            state, why_failed = "failed", cf.classify(1, detail, "").get("kind", "error")
-        elif tail["state"] == desktop_handover.DONE:
-            detail = desktop_handover.waiting_on_person(record)
-            state = "waiting" if detail else None
-        if state is None:
-            continue
-        at = cf.parse_iso(tail["at"]) or dt.datetime.fromtimestamp(st.st_mtime, cf.LOCAL_TZ)
-        title = record.get("title")
-        task = record.get("scheduledTaskId")
-        found.append({"session": "local_" + sid, "cli_session": cli_id,
-                      "title": one_line(title, 70) if isinstance(title, str) and title.strip()
-                      else "(no title)",
-                      "state": state, "why": why_failed, "at": cf.iso(at.astimezone(cf.LOCAL_TZ)),
-                      "detail": one_line(detail, 160),
-                      "cwd": record.get("cwd") if isinstance(record.get("cwd"), str) else None,
-                      "scheduled_task": task if isinstance(task, str) and task else None,
-                      "_when": at.timestamp()})
-    found.sort(key=lambda c: (c["state"] == "waiting", -c["_when"]))
-    for chat in found:
-        del chat["_when"]
-    out["chats"] = found
-    return out
+    return newest
+
+
+def _handover_chat(sid, record, paths, running, oldest):
+    """One chat's entry of the hand-over list, or None when the chat was not left
+    in the middle of anything."""
+    if record.get("isArchived") is True:
+        return None
+    cli_id = record.get("cliSessionId")
+    cli_id = cli_id if isinstance(cli_id, str) and cli_id else sid
+    path = paths.get(cli_id)
+    if path is None:
+        return None
+    try:
+        st = os.stat(path)
+        if st.st_mtime < oldest:
+            return None
+        tail = chat_state(path)
+    except OSError:
+        return None
+    state, detail, why_failed = None, tail["detail"], None
+    if tail["state"] == desktop_handover.CUT_OFF:
+        born = getattr(st, "st_birthtime", None)
+        if running is not None and not desktop_handover.is_alive(cli_id, born, running):
+            state = "cut_off"
+    elif tail["state"] == desktop_handover.FAILED:
+        state, why_failed = "failed", cf.classify(1, detail, "").get("kind", "error")
+    elif tail["state"] == desktop_handover.DONE:
+        detail = desktop_handover.waiting_on_person(record)
+        state = "waiting" if detail else None
+    if state is None:
+        return None
+    at = cf.parse_iso(tail["at"]) or dt.datetime.fromtimestamp(st.st_mtime, cf.LOCAL_TZ)
+    title = record.get("title")
+    task = record.get("scheduledTaskId")
+    return {"session": "local_" + sid, "cli_session": cli_id,
+            "title": one_line(title, 70) if isinstance(title, str) and title.strip()
+            else "(no title)",
+            "state": state, "why": why_failed, "at": cf.iso(at.astimezone(cf.LOCAL_TZ)),
+            "detail": one_line(detail, 160),
+            "cwd": record.get("cwd") if isinstance(record.get("cwd"), str) else None,
+            "scheduled_task": task if isinstance(task, str) and task else None,
+            "_when": at.timestamp()}
 
 
 def clock(stamp):
@@ -1291,6 +1350,8 @@ def chat_line(chat):
         text += " - cut off mid-turn at %s" % clock(chat["at"])
         if chat["detail"]:
             text += " (last step: %s)" % one_line(chat["detail"], 70)
+        if chat.get("restart_sent"):
+            text += ", restart sent at %s" % clock(chat["restart_sent"])
     elif chat["state"] == "failed":
         how = {"limit": "stopped at a usage limit", "auth": "stopped because the login ended"}.get(
             chat["why"], "stopped by an error")
@@ -1364,6 +1425,281 @@ def cmd_handover(cfg, args):
         lines.append('  to go on - open the chat and say "continue". A chat in the app can send '
                      "that to another chat for you.")
     print("\n".join(lines))
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Restarting the chats a sign-out cut off
+# --------------------------------------------------------------------------
+
+PICKUP_PROMPT = """---
+name: %(id)s
+description: Restart the chats that an account switch cut off in the middle of a turn. It starts by itself when the Claude app signs in to another account.
+---
+
+You are the automatic pick-up after an account switch. The Claude desktop app was just signed in to another account. Signing it out stopped every chat that was in the middle of a turn, and nothing continues those chats by itself. Restart them now. Nobody is watching this run, so ask no questions: do the steps and end with a short report.
+
+1. Run this command and read the JSON it prints:
+
+   %(script)s sync restart --json
+
+   "chats" are the chats to restart. "skipped" are the ones it left alone, each with the reason. The command has already made sure no chat is restarted twice: every chat in "chats" is now claimed for this run. Never restart a chat that is not in "chats", and do not run the command a second time to get more.
+
+2. If "chats" is empty, say so in one line, add the "note" if there is one, and stop.
+
+3. For each chat in "chats", in the order given, one at a time:
+   - Send it its "message", word for word, with the tool mcp__ccd_session_mgmt__send_message (session_id = the chat's "session"). If the tool is not loaded yet, load it with ToolSearch: select:mcp__ccd_session_mgmt__send_message
+   - A result of "delivered" or "queued" means it was sent. If the send fails, note the error and go on with the next chat.
+   - Before the next chat, wait about a minute, so they do not all start at once (for example: python3 -c "import time; time.sleep(60)").
+
+4. End with a short report: the chats you restarted, the sends that failed, and the chats that were skipped and why. Do none of the chats' work yourself.
+"""
+
+
+def auto_restart_on(cfg):
+    """Chats a sign-out cut off are restarted by the app itself only when the
+    config says "desktop_sync": {"auto_restart": true}."""
+    return settings(cfg).get("auto_restart") is True
+
+
+def out_of_usage(account):
+    """When the account has used up its week: the time that week starts again, as
+    text. None when it has usage left or nothing is known. The readings are the
+    switch helper's (account_switch.py), when that is there."""
+    try:
+        import account_switch
+        reading = account_switch.read_state()["usage"].get(account)
+        used, resets = reading.get("week_util"), cf.parse_iso(reading.get("week_resets_at"))
+    except Exception:   # no switch helper, no reading yet, or readings in another shape
+        return None
+    if (isinstance(used, (int, float)) and not isinstance(used, bool) and used >= OUT_OF_USAGE_AT
+            and resets is not None and resets > cf.now_local()):
+        return clock(cf.iso(resets))
+    return None
+
+
+def pickup_prompt_path(cfg):
+    """The pick-up task's instructions: <shared config folder>/scheduled-tasks/<id>/SKILL.md,
+    where the app keeps every scheduled task's prompt."""
+    shared = cfg.get("default_config_dir") if isinstance(cfg, dict) else None
+    return (Path(os.path.expanduser(shared if isinstance(shared, str) and shared else "~/.claude"))
+            / "scheduled-tasks" / PICKUP_ID / "SKILL.md")
+
+
+def ensure_pickup_prompt(cfg):
+    """Write the pick-up task's instructions if they are not there. A file that
+    exists is never changed, so it can be edited by hand. Returns its path."""
+    path = pickup_prompt_path(cfg)
+    if not os.path.lexists(str(path)):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        text = PICKUP_PROMPT % {"id": PICKUP_ID, "script": shlex.quote(str(ACCOUNTS_SCRIPT))}
+        _write_bytes(path, text.encode("utf-8"), 0o644)
+    return path
+
+
+def pickup_base(cfg):
+    """What a fresh entry for the pick-up task starts from."""
+    return {"id": PICKUP_ID, "displayName": PICKUP_NAME, "filePath": str(pickup_prompt_path(cfg)),
+            "cwd": os.path.expanduser("~"),
+            # It messages other chats with nobody there to approve that.
+            "permissionMode": "bypassPermissions", "permissionModeCarried": True}
+
+
+def read_claims():
+    """restarts.json: {chat id: {"cut_at", "claimed_at", "claimed"}}, the chats that
+    were claimed for a restart."""
+    data = cf.read_json(sync_dir() / RESTARTS_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def terminal_handoffs():
+    """{session id: when it was last handed to Terminal} from the end of the event
+    log. The StopFailure hook writes such an event when it continues a chat on
+    another account, and that chat must not be restarted here as well."""
+    try:
+        entries, _whole = read_tail(Path(cf.state_dir()) / "events.jsonl", EVENTS_TAIL_BYTES)
+    except OSError:
+        return {}
+    found = {}
+    for e in entries:
+        if isinstance(e, dict) and e.get("event") == "handoff" and isinstance(e.get("session"), str):
+            at = cf.parse_iso(e.get("t"))
+            if at is not None:
+                found[e["session"]] = at
+    return found
+
+
+def restart_claims(cfg, dry_run=False):
+    """Claim the chats that should be restarted now, each one once, and return
+    {"account", "chats": [{"session", "title", "cut_at", "detail", "message"}],
+     "skipped": [{"session", "title", "why"}], "note"}.
+
+    Only a chat that a sign-out (or a crash) cut off in the middle of a turn in
+    the last RESTART_HOURS is restarted. Never one whose turn ended at a usage
+    limit (the hook hands those to Terminal), one that was handed to Terminal or
+    forked since, a scheduled run, one that is being restarted already, or one
+    that waits for the person. A dry run claims nothing."""
+    out = {"account": None, "chats": [], "skipped": [], "note": None}
+    ddir = desktop_dir(cfg)
+    folders, _skipped = resolve_folders(cfg, ddir)
+    active = active_account_uuid(ddir)
+    mine = [f["account"] for f in folders if same_id(f["account_uuid"], active)]
+    out["account"] = mine[0] if len(mine) == 1 else None
+    until = out_of_usage(out["account"]) if out["account"] else None
+    if until:
+        out["note"] = ("the app is signed in to %s, which is out of usage until %s, so nothing is "
+                       "restarted" % (out["account"], until))
+        return out
+    if dry_run:
+        return _restart_claims(cfg, out, None)
+    sdir = private_dir(sync_dir())
+    with open(str(sdir / ".restart.lock"), "a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)   # two pick-up runs take turns
+        return _restart_claims(cfg, out, sdir)
+
+
+def _restart_claims(cfg, out, sdir):
+    first = handover(cfg, RESTART_HOURS)
+    second = first
+    if RESTART_RECHECK_SECONDS:
+        # A chat whose process is only being restarted by the app looks cut off for
+        # a moment. A second look tells: a chat that is really cut off has not moved.
+        time.sleep(RESTART_RECHECK_SECONDS)
+        second = handover(cfg, RESTART_HOURS)
+    out["note"] = second["note"]
+    still = {c["session"]: c["at"] for c in second["chats"] if c["state"] == "cut_off"}
+    handoffs = terminal_handoffs()
+    forks = {}
+    for record in recent_records(cfg, time.time() - RESTART_HOURS * 3600).values():
+        parent, made = record.get("forkedFromSessionId"), record.get("createdAt")
+        if isinstance(parent, str) and isinstance(made, (int, float)) and not isinstance(made, bool):
+            forks[parent] = max(forks.get(parent, 0), made)
+    claims, now = read_claims(), time.time()
+    for c in first["chats"]:
+        if c["state"] == "waiting":
+            continue   # it needs an answer from the person, not a push
+        cut = cf.parse_iso(c["at"])
+        handed = handoffs.get(c["cli_session"])
+        why_not = None
+        if c["state"] == "failed":
+            why_not = "its turn ended at a usage limit or an error, it was not cut off"
+        elif c["scheduled_task"]:
+            why_not = "it is a run of the scheduled task %s, which runs again by itself" % (
+                c["scheduled_task"])
+        elif c["restart_sent"]:
+            why_not = "a restart was sent at %s" % clock(c["restart_sent"])
+        elif still.get(c["session"]) != c["at"]:
+            why_not = "it moved on while this ran"
+        elif handed is not None and cut is not None and handed >= cut - dt.timedelta(minutes=5):
+            why_not = "it was handed to Terminal at %s" % clock(cf.iso(handed))
+        elif cut is not None and forks.get(c["session"], 0) > cut.timestamp() * 1000:
+            why_not = "a fork of it carried on"
+        if why_not:
+            out["skipped"].append({"session": c["session"], "title": c["title"], "why": why_not})
+            continue
+        claims[c["session"]] = {"cut_at": c["at"], "claimed_at": now, "claimed": cf.iso(cf.now_local())}
+        out["chats"].append({"session": c["session"], "title": c["title"], "cut_at": c["at"],
+                             "detail": c["detail"],
+                             "message": desktop_handover.restart_message(clock(c["at"]), c["detail"])})
+    if out["chats"] and sdir is not None:
+        keep = {k: v for k, v in claims.items()
+                if isinstance(v, dict) and isinstance(v.get("claimed_at"), (int, float))
+                and now - v["claimed_at"] < 2 * 86400}
+        cf.atomic_write_json(Path(sdir) / RESTARTS_FILE, keep)
+        cf.log_event("desktop_restart", account=out["account"], chats=len(out["chats"]),
+                     skipped=len(out["skipped"]))
+    return out
+
+
+def cmd_restart(cfg, args):
+    if any(a not in ("--json", "--dry-run") for a in args):
+        print(USAGE)
+        return 2
+    dry = "--dry-run" in args
+    try:
+        r = restart_claims(cfg, dry_run=dry)
+    except (OSError, TypeError, ValueError) as e:
+        print("Could not claim the chats to restart: %s" % why(e))
+        return 1
+    if "--json" in args:
+        print(json.dumps(r, indent=2))
+        return 0
+    lines = ["Chats to restart (cut off in the last %s%s)%s" % (
+        plural(RESTART_HOURS, "hour"),
+        ", app signed in as %s" % r["account"] if r["account"] else "",
+        " - dry run, nothing claimed" if dry else "")]
+    if r["chats"]:
+        lines.append("  %s - send each one its message (--json has the text):" % (
+            "would be claimed" if dry else "claimed for a restart"))
+        for c in r["chats"]:
+            lines.append("    %s - cut off at %s" % (c["title"], clock(c["cut_at"])))
+            lines.append("      %s" % c["session"])
+    if r["skipped"]:
+        lines.append("  left alone:")
+        lines.extend("    %s - %s" % (c["title"], c["why"]) for c in r["skipped"])
+    if r["note"]:
+        lines.append("  note - %s" % r["note"])
+    if not r["chats"] and not r["skipped"] and not r["note"]:
+        lines.append("  nothing to restart")
+    print("\n".join(lines))
+    return 0
+
+
+def restart_status_lines(cfg):
+    """For `sync status` and `sync auto-restart`: is the pick-up task waiting in the
+    other account's task list? It only reads. Never raises."""
+    try:
+        if not auto_restart_on(cfg):
+            return ['  auto-restart - off: a chat cut off by a switch waits for a "continue" '
+                    "(claude-accounts sync auto-restart on)"]
+        ddir = desktop_dir(cfg)
+        folders, _skipped = resolve_folders(cfg, ddir)
+        active = active_account_uuid(ddir)
+        lines = []
+        for f in folders:
+            if same_id(f["account_uuid"], active):
+                continue
+            try:
+                tasks = read_tasks(f["path"] / TASKS_FILE)[0]["scheduledTasks"]
+            except (Unsafe, desktop_tasks.NotATaskList, OSError):
+                continue
+            pick = next((t for t in tasks if t["id"] == PICKUP_ID), None)
+            until = out_of_usage(f["account"])
+            if pick is not None and desktop_tasks.is_armed(pick, time.time() * 1000):
+                lines.append("  auto-restart - on: chats cut off by a switch restart by themselves "
+                             "when the app signs in to %s" % f["account"])
+            elif until:
+                lines.append("  auto-restart - on, but not armed for %s: it is out of usage until %s"
+                             % (f["account"], until))
+            else:
+                lines.append("  auto-restart - on, the next sync arms it for %s" % f["account"])
+        return lines
+    except Exception:
+        return []
+
+
+def cmd_auto_restart(cfg, args):
+    if args not in ([], ["on"], ["off"]):
+        print(USAGE)
+        return 2
+    if args:
+        on = args == ["on"]
+        print(set_setting(cfg, "auto_restart", on))
+        if on:
+            try:
+                print("The pick-up task's instructions: %s" % tilde(ensure_pickup_prompt(cfg)))
+            except OSError as e:
+                print("Could not write the pick-up task's instructions: %s" % why(e))
+                return 1
+            print("From the next sync on, a task named \"%s\" waits in the task list of every "
+                  "account the app is not signed in to. It starts when the app signs in there, in "
+                  "bypass mode (nobody is there to approve its messages), and restarts the chats "
+                  "the sign-out cut off." % PICKUP_NAME)
+        else:
+            print("The next sync switches the waiting pick-up task off. Chats cut off by a switch "
+                  "then wait until someone tells them to continue (claude-accounts sync handover).")
+        return 0
+    print("\n".join(["Restarting chats after a switch"] + restart_status_lines(cfg)))
     return 0
 
 
@@ -1885,7 +2221,8 @@ def _save_last(sdir, report):
         news = [c["action"] for c in row["changes"] if not desktop_tasks.only_run_times(c)]
         if row["written"] and news:
             cf.log_event("desktop_task_sync", account=row["account"], added=news.count("add"),
-                         updated=news.count("update"), marked_run=news.count("mark_run"))
+                         updated=news.count("update"), marked_run=news.count("mark_run"),
+                         armed=news.count("arm"), disarmed=news.count("disarm"))
     for row in (report.get("backlog") or {}).get("targets", []):
         if row["written"]:
             cf.log_event("desktop_backlog_sync", account=row["account"], added=len(row["added"]),
@@ -2116,6 +2453,10 @@ def cli(cfg, argv):
         return cmd_install(cfg, args[1:])
     if sub == "handover":
         return cmd_handover(cfg, args[1:])
+    if sub == "restart":
+        return cmd_restart(cfg, args[1:])
+    if sub == "auto-restart":
+        return cmd_auto_restart(cfg, args[1:])
     if sub in ("uninstall", "status"):
         if len(args) != 1:
             print(USAGE)
@@ -2195,7 +2536,13 @@ def _backup_copy(path):
 def set_enabled(cfg, value):
     """Set desktop_sync.enabled in the config file on disk and change nothing else
     (the hook reads it to sync at handoff time). Returns the line to print."""
-    snippet = '"desktop_sync": {"enabled": %s}' % json.dumps(value)
+    return set_setting(cfg, "enabled", value)
+
+
+def set_setting(cfg, key, value):
+    """Set one true/false switch of the "desktop_sync" block in the config file on
+    disk and change nothing else. Returns the line to print."""
+    snippet = '"desktop_sync": {"%s": %s}' % (key, json.dumps(value))
     path = config_file(cfg)
     if not path or not os.path.isfile(path):
         return "No config file found. Add this to your config: %s" % snippet
@@ -2209,9 +2556,9 @@ def set_enabled(cfg, value):
     block = {} if block is None else block
     if not isinstance(block, dict):
         return "%s has a shape this tool doesn't expect. Add this yourself: %s" % (tilde(path), snippet)
-    if block.get("enabled") is value:
-        return "desktop_sync.enabled is already %s in %s." % (json.dumps(value), tilde(path))
-    raw["desktop_sync"] = dict(block, enabled=value)
+    if block.get(key) is value:
+        return "desktop_sync.%s is already %s in %s." % (key, json.dumps(value), tilde(path))
+    raw["desktop_sync"] = dict(block, **{key: value})
     try:
         mode = stat.S_IMODE(os.stat(real).st_mode)
         backup = _backup_copy(real)
@@ -2219,8 +2566,8 @@ def set_enabled(cfg, value):
                      mode)
     except OSError as e:
         return "Could not update %s (%s). Add this to it yourself: %s" % (tilde(path), why(e), snippet)
-    return "Set desktop_sync.enabled to %s in %s (old copy: %s)." % (
-        json.dumps(value), tilde(path), tilde(backup))
+    return "Set desktop_sync.%s to %s in %s (old copy: %s)." % (
+        key, json.dumps(value), tilde(path), tilde(backup))
 
 
 def launchctl(*args):
@@ -2352,6 +2699,7 @@ def cmd_status(cfg):
     lines.extend(task_status_lines(cfg))
     lines.extend(backlog_status_lines(cfg))
     lines.extend(handover_status_lines(cfg))
+    lines.extend(restart_status_lines(cfg))
     lines.append("  log - %s" % tilde(sync_dir() / "agent.log"))
     print("\n".join(lines))
     return rc

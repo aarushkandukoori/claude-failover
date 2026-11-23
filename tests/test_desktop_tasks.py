@@ -307,6 +307,70 @@ class PlanTest(unittest.TestCase):
         self.assertEqual([o["id"] for o in only_there], ["stranger"])
 
 
+class PickupTest(unittest.TestCase):
+    """The pick-up task: the one task whose copy on the other account is kept armed."""
+    BASE = {"id": "pick-up", "displayName": "Pick up", "filePath": "/tasks/pick-up/SKILL.md",
+            "cwd": "/Users/me", "permissionMode": "bypassPermissions", "permissionModeCarried": True}
+
+    def plan(self, mine, theirs, want=True):
+        before = copy.deepcopy((mine, theirs, self.BASE))
+        out = dt.pickup_plan(mine, theirs, self.BASE, want, NOW)
+        self.assertEqual((mine, theirs, self.BASE), before)      # no input is changed
+        return out
+
+    def test_armed_means_due_the_moment_the_app_reads_the_list(self):
+        self.assertTrue(dt.is_armed(once("p", NOW - 1000), NOW))
+        self.assertTrue(dt.is_armed(once("p", NOW - 90 * 24 * HOUR), NOW))    # however long ago
+        self.assertFalse(dt.is_armed(once("p", NOW + HOUR), NOW))
+        self.assertFalse(dt.is_armed(once("p", NOW - 1000, enabled=False), NOW))
+        self.assertFalse(dt.is_armed(ran(once("p", NOW - 1000)), NOW))
+        self.assertFalse(dt.is_armed(cron("p"), NOW))
+        self.assertFalse(dt.is_armed({"id": "p", "enabled": True}, NOW))       # run by hand
+
+    def test_a_fresh_entry_is_armed(self):
+        entry, action = self.plan(None, None)
+        self.assertEqual(action, "arm")
+        self.assertEqual(entry, dict(self.BASE, createdAt=NOW, fireAt=NOW - 1000, enabled=True))
+        self.assertTrue(dt.is_armed(entry, NOW))
+        self.assertEqual(self.plan(None, entry), (entry, None))      # and then it is left alone
+
+    def test_after_it_ran_it_is_armed_again(self):
+        fired = ran(dict(self.BASE, createdAt=NOW - 5 * HOUR, fireAt=NOW - 5 * HOUR,
+                         missedRunScanFloor="2026-11-01T00:00:00.000Z", notifySessionId="local_x"))
+        entry, action = self.plan(None, fired)
+        self.assertEqual(action, "arm")
+        self.assertEqual(entry, dict(self.BASE, createdAt=NOW - 5 * HOUR, fireAt=NOW - 1000,
+                                     enabled=True))
+        for gone in ("lastRunAt", "lastScheduledFor", "missedRunScanFloor", "notifySessionId"):
+            self.assertNotIn(gone, entry)
+
+    def test_the_signed_in_accounts_settings_travel_but_not_its_schedule(self):
+        # There the task is one that is run by hand (made in the app), or one that already ran.
+        mine = {"id": "pick-up", "displayName": "Renamed in the app", "enabled": True, "createdAt": 5,
+                "filePath": "/tasks/pick-up/SKILL.md", "cwd": "/Users/me", "permissionMode": "auto",
+                "model": "opus", "madeByClaude": True, "promptWrittenBy": ["abc"],
+                "promptFileHash": "h.h", "cronExpression": "0 9 * * *",
+                "lastRunAt": "2026-11-22T14:00:07.000Z"}
+        theirs = dict(self.BASE, enabled=False, fireAt=NOW - HOUR, createdAt=9,
+                      lastRunAt="2026-11-22T10:00:00.000Z")
+        entry, action = self.plan(mine, theirs)
+        self.assertEqual(action, "arm")
+        self.assertEqual(entry, {
+            "id": "pick-up", "displayName": "Renamed in the app", "filePath": "/tasks/pick-up/SKILL.md",
+            "createdAt": 5, "cwd": "/Users/me", "model": "opus", "permissionMode": "auto",
+            "permissionModeCarried": True, "madeByClaude": True, "promptWrittenBy": ["abc"],
+            "promptFileHash": "h.h", "fireAt": NOW - 1000, "enabled": True})
+
+    def test_not_wanted_means_switched_off_never_deleted(self):
+        armed = dict(self.BASE, createdAt=NOW, fireAt=NOW - 1000, enabled=True)
+        entry, action = self.plan(None, armed, want=False)
+        self.assertEqual((entry, action), (dict(armed, enabled=False), "disarm"))
+        self.assertEqual(self.plan(None, entry, want=False), (entry, None))
+        self.assertEqual(self.plan(None, None, want=False), (None, None))
+        fired = ran(armed)
+        self.assertEqual(self.plan(None, fired, want=False), (fired, None))
+
+
 class TextTest(unittest.TestCase):
 
     def test_label_and_schedule(self):

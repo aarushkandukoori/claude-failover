@@ -151,5 +151,31 @@ class AliveTest(unittest.TestCase):
         self.assertFalse(dh.is_alive("new", None, running))
 
 
+class ClaimTest(unittest.TestCase):
+    CUT = "2026-11-23T01:03:28-05:00"
+
+    def test_a_claim_stands_for_one_cut_and_for_a_while(self):
+        claim = {"cut_at": self.CUT, "claimed_at": 1000.0, "claimed": "2026-11-23T01:14:00-05:00"}
+        self.assertTrue(dh.claim_is_live(claim, self.CUT, 1000.0))
+        self.assertTrue(dh.claim_is_live(claim, self.CUT, 1000.0 + dh.CLAIM_MINUTES * 60 - 1))
+        self.assertFalse(dh.claim_is_live(claim, self.CUT, 1000.0 + dh.CLAIM_MINUTES * 60))   # never sent
+        self.assertFalse(dh.claim_is_live(claim, "2026-11-23T02:40:00-05:00", 1000.0))       # cut off again
+        self.assertFalse(dh.claim_is_live(claim, self.CUT, 999.0))                           # a clock that went back
+
+    def test_what_is_not_a_claim(self):
+        for claim in (None, {}, "yes", {"cut_at": self.CUT}, {"cut_at": self.CUT, "claimed_at": "now"},
+                      {"cut_at": self.CUT, "claimed_at": True}):
+            self.assertFalse(dh.claim_is_live(claim, self.CUT, 1000.0), claim)
+
+    def test_the_restart_message_says_check_first(self):
+        text = dh.restart_message("1:03 AM", "Bash - Run the tests")
+        self.assertTrue(text.startswith("Automatic pick-up after an account switch: your last turn was "
+                                        "cut off at 1:03 AM, when the Claude app was signed out. The last "
+                                        "step you had started: Bash - Run the tests. "))
+        self.assertIn("First check what already happened, so that nothing is done or sent twice", text)
+        self.assertNotIn("\n", text)
+        self.assertNotIn("The last step", dh.restart_message("1:03 AM", ""))
+
+
 if __name__ == "__main__":
     unittest.main()

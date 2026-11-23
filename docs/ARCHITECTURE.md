@@ -519,6 +519,7 @@ this table lists all of them.
 | `desktop_sync.app_data_dir` | `~/Library/Application Support/Claude` | The desktop app's data folder. Also `$CLAUDE_FAILOVER_DESKTOP_DIR`. |
 | `desktop_sync.scheduled_tasks` | `true` | Each sync copies the signed-in account's desktop scheduled tasks into the other accounts' task lists. `false` = never write a task list, only list the tasks that would not run. See [DESKTOP-SYNC.md](DESKTOP-SYNC.md#scheduled-tasks). |
 | `desktop_sync.backlog` | `true` | Each sync copies the signed-in account's task backlog into the other accounts' backlogs. `false` = never write a backlog. See [DESKTOP-SYNC.md](DESKTOP-SYNC.md#the-task-backlog). |
+| `desktop_sync.auto_restart` | `false` | `true` (set by `claude-accounts sync auto-restart on`) keeps a pick-up task armed in the task list of every account the app is not signed in to. It starts when the app signs in there and restarts the chats the sign-out cut off. See [DESKTOP-SYNC.md](DESKTOP-SYNC.md#restarting-cut-off-chats-by-themselves). |
 | `security` | `/usr/bin/security` | The keychain tool used for spare tokens. Tests point it at a fake. |
 
 **Tip** - if your desktop app stays signed in to one account, put that account last in

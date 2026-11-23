@@ -21,6 +21,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -1976,8 +1977,8 @@ def returned(text, at):
         {"type": "tool_result", "tool_use_id": "t1", "content": text}]}}
 
 
-class HandoverTest(Base):
-    """`claude-accounts sync handover`: the chats that were left in the middle of their work."""
+class ChatsBase(Base):
+    """Chat records with transcripts that end in a given way."""
     A, B, C = "2026-11-23T05:26:01.000Z", "2026-11-23T05:26:20.000Z", "2026-11-23T05:26:23.000Z"
 
     def chat(self, sid, entries, account="personal", **fields):
@@ -1997,6 +1998,10 @@ class HandoverTest(Base):
     def states(self, **kw):
         return [(c["session"], c["state"]) for c in ds.handover(self.cfg, **kw)["chats"]]
 
+
+class HandoverTest(ChatsBase):
+    """`claude-accounts sync handover`: the chats that were left in the middle of their work."""
+
     def test_cut_off_chat_is_listed_and_a_running_one_is_not(self):
         self.cut_off("killed", title="Killed by the sign-out")
         self.cut_off("alive", title="Still working")
@@ -2010,7 +2015,8 @@ class HandoverTest(Base):
         self.assertEqual(h["chats"], [{
             "session": "local_killed", "cli_session": "cli-killed", "title": "Killed by the sign-out",
             "state": "cut_off", "why": None, "at": cf.iso(cf.parse_iso(self.C).astimezone(cf.LOCAL_TZ)),
-            "detail": "Bash - Run the build", "cwd": "/tmp/proj", "scheduled_task": None}])
+            "detail": "Bash - Run the build", "cwd": "/tmp/proj", "scheduled_task": None,
+            "restart_sent": None}])
         self.assertEqual(ds.handover_lines(self.cfg), [
             "Killed by the sign-out - cut off mid-turn at %s (last step: Bash - Run the build)"
             % ds.clock(self.C)])
@@ -2224,6 +2230,385 @@ class HandoverTest(Base):
         other_day = (now - dt.timedelta(days=40)).replace(hour=23, minute=40)
         self.assertEqual(ds.clock(cf.iso(other_day)), other_day.strftime("%b %-d") + ", 11:40 PM")
         self.assertEqual(ds.clock("not a time"), "?")
+
+
+class RestartTest(ChatsBase):
+    """`claude-accounts sync restart`: claim the chats a sign-out cut off, each one once."""
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(ds, "RESTART_RECHECK_SECONDS", 0)   # no waiting in tests
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.sign_in(W_ACCT)
+
+    def recent(self, seconds_ago=60):
+        """A time of a cut `seconds_ago` back, as the app writes it."""
+        at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=seconds_ago)
+        return at.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    def cut(self, sid, at=None, **fields):
+        at = at or self.recent()
+        return self.chat(sid, [said("go", at), called("Bash", "Run the build", at),
+                               returned("Exit code 137", at)], **fields)
+
+    def claims(self):
+        path = self.state / "desktop-sync" / "restarts.json"
+        return json.loads(path.read_text()) if path.exists() else {}
+
+    def test_cut_off_chat_is_claimed_once(self):
+        at = self.recent()
+        self.cut("killed", at, title="Killed by the sign-out")
+        r = ds.restart_claims(self.cfg)
+        self.assertEqual((r["account"], r["skipped"], r["note"]), ("work", [], None))
+        self.assertEqual(len(r["chats"]), 1)
+        chat = r["chats"][0]
+        self.assertEqual((chat["session"], chat["title"], chat["detail"]),
+                         ("local_killed", "Killed by the sign-out", "Bash - Run the build"))
+        self.assertEqual(chat["message"], ds.desktop_handover.restart_message(
+            ds.clock(chat["cut_at"]), "Bash - Run the build"))
+        claim = self.claims()["local_killed"]
+        self.assertEqual(claim["cut_at"], chat["cut_at"])
+        self.assertLess(abs(claim["claimed_at"] - time.time()), 30)
+        events = [json.loads(line) for line in (self.state / "events.jsonl").read_text().splitlines()]
+        self.assertEqual([(e["event"], e["account"], e["chats"]) for e in events],
+                         [("desktop_restart", "work", 1)])
+        # A second helper, or a second run, gets nothing: the chat is taken.
+        again = ds.restart_claims(self.cfg)
+        self.assertEqual(again["chats"], [])
+        self.assertEqual(again["skipped"], [{"session": "local_killed", "title": "Killed by the sign-out",
+                                             "why": "a restart was sent at %s" % ds.clock(claim["claimed"])}])
+        self.assertEqual(ds.handover(self.cfg)["chats"][0]["restart_sent"], claim["claimed"])
+        self.assertTrue(ds.handover_lines(self.cfg)[0].endswith(
+            ", restart sent at %s" % ds.clock(claim["claimed"])))
+
+    def test_a_claim_that_led_to_nothing_runs_out(self):
+        self.cut("killed")
+        self.assertEqual(len(ds.restart_claims(self.cfg)["chats"]), 1)
+        path = self.state / "desktop-sync" / "restarts.json"
+        claims = json.loads(path.read_text())
+        claims["local_killed"]["claimed_at"] -= ds.desktop_handover.CLAIM_MINUTES * 60 + 1
+        path.write_text(json.dumps(claims))
+        self.assertEqual([c["session"] for c in ds.restart_claims(self.cfg)["chats"]], ["local_killed"])
+
+    def test_a_chat_cut_off_again_is_a_new_claim(self):
+        path = self.cut("killed", self.recent(300))
+        self.assertEqual(len(ds.restart_claims(self.cfg)["chats"]), 1)
+        # It was restarted, worked on, and a second sign-out cut it off again.
+        with open(str(path), "a") as f:
+            for entry in (answered("carried on", self.recent(200)), said("more", self.recent(100)),
+                          returned("Exit code 137", self.recent(90))):
+                f.write(json.dumps(entry) + "\n")
+        self.assertEqual([c["session"] for c in ds.restart_claims(self.cfg)["chats"]], ["local_killed"])
+
+    def test_chats_that_are_left_alone(self):
+        at = self.recent(120)
+        limit = answered("You've hit your weekly limit · resets Sat 11pm", at,
+                         stop="stop_sequence", isApiErrorMessage=True)
+        self.chat("limit", [said("go", at), limit], title="At its limit")
+        self.cut("run", at, title="Hourly run", scheduledTaskId="hourly")
+        self.cut("handed", at, title="Went to Terminal")
+        self.cut("forked", at, title="Was forked")
+        self.cut("alive", at, title="Still working")
+        self.done("blocked", title="Waits for him", lastAssistantUuid="u1", postTurnSummaryFor="u1",
+                  postTurnSummary={"status_category": "blocked", "needs_action": "A or B?"})
+        self.done("fine")
+        self.cut("killed", at, title="Killed by the sign-out")
+        os.environ["CLAUDE_FAILOVER_RUNNING_CHATS"] = "cli-alive"
+        self.record("personal", "the-fork", transcript=False, forkedFromSessionId="local_forked",
+                    createdAt=int(time.time() * 1000))
+        self.state.mkdir(exist_ok=True)
+        (self.state / "events.jsonl").write_text(
+            json.dumps({"t": cf.iso(cf.now_local()), "event": "handoff", "session": "cli-handed"}) + "\n"
+            + json.dumps({"t": "2020-01-01T00:00:00-05:00", "event": "handoff", "session": "cli-killed"})
+            + "\nnot json\n")
+        r = ds.restart_claims(self.cfg)
+        self.assertEqual([c["session"] for c in r["chats"]], ["local_killed"])   # an old handoff does not count
+        why = {c["title"]: c["why"] for c in r["skipped"]}
+        self.assertEqual(set(why), {"At its limit", "Hourly run", "Went to Terminal", "Was forked"})
+        self.assertEqual(why["At its limit"], "its turn ended at a usage limit or an error, it was not "
+                                              "cut off")
+        self.assertEqual(why["Hourly run"], "it is a run of the scheduled task hourly, which runs again "
+                                            "by itself")
+        self.assertTrue(why["Went to Terminal"].startswith("it was handed to Terminal at "))
+        self.assertEqual(why["Was forked"], "a fork of it carried on")
+        self.assertEqual(list(self.claims()), ["local_killed"])
+
+    def test_only_a_recent_cut_is_restarted(self):
+        path = self.cut("stale", title="Cut off this morning")
+        long_ago = time.time() - 7 * 3600
+        os.utime(str(path), (long_ago, long_ago))
+        self.assertEqual(self.states(), [("local_stale", "cut_off")])        # still on the list
+        r = ds.restart_claims(self.cfg)
+        self.assertEqual((r["chats"], r["skipped"]), ([], []))
+        self.assertEqual(self.claims(), {})
+
+    def test_a_chat_that_moves_between_the_two_looks_is_left_alone(self):
+        path = self.cut("respawning", title="Process was only restarting")
+        self.cut("killed", title="Really cut off")
+        real = ds.handover
+        looks = []
+
+        def look(cfg, hours):
+            looks.append(hours)
+            if len(looks) == 2:      # by the second look the first chat has carried on
+                with open(str(path), "a") as f:
+                    f.write(json.dumps(called("Bash", "Next step", self.recent(0))) + "\n")
+            return real(cfg, hours)
+
+        with mock.patch.object(ds, "RESTART_RECHECK_SECONDS", 0.01), \
+                mock.patch.object(ds, "handover", side_effect=look):
+            r = ds.restart_claims(self.cfg)
+        self.assertEqual(looks, [ds.RESTART_HOURS, ds.RESTART_HOURS])
+        self.assertEqual([c["session"] for c in r["chats"]], ["local_killed"])
+        self.assertEqual(r["skipped"], [{"session": "local_respawning",
+                                         "title": "Process was only restarting",
+                                         "why": "it moved on while this ran"}])
+
+    def test_nothing_is_restarted_on_an_account_that_is_out_of_usage(self):
+        self.cut("killed")
+        with mock.patch.object(ds, "out_of_usage", return_value="Nov 28, 11:00 PM") as out:
+            r = ds.restart_claims(self.cfg)
+        out.assert_called_once_with("work")
+        self.assertEqual((r["chats"], r["skipped"]), ([], []))
+        self.assertEqual(r["note"], "the app is signed in to work, which is out of usage until "
+                                    "Nov 28, 11:00 PM, so nothing is restarted")
+        self.assertEqual(self.claims(), {})
+
+    def test_usage_readings_come_from_the_switch_helper(self):
+        soon = cf.iso(cf.now_local() + dt.timedelta(days=3))
+        past = cf.iso(cf.now_local() - dt.timedelta(hours=1))
+        fake = types.ModuleType("account_switch")
+        usage = {"spent": {"week_util": 0.99, "week_resets_at": soon},
+                 "fresh": {"week_util": 0.03, "week_resets_at": soon},
+                 "reset": {"week_util": 1.0, "week_resets_at": past},
+                 "odd": {"week_util": "a lot"}, "bare": {}}
+        fake.read_state = lambda: {"usage": usage}
+        with mock.patch.dict(sys.modules, {"account_switch": fake}):
+            self.assertEqual(ds.out_of_usage("spent"), ds.clock(soon))
+            for account in ("fresh", "reset", "odd", "bare", "nobody"):
+                self.assertIsNone(ds.out_of_usage(account), account)
+            fake.read_state = lambda: 1 / 0
+            self.assertIsNone(ds.out_of_usage("spent"))
+        with mock.patch.dict(sys.modules, {"account_switch": None}):     # no switch helper at all
+            self.assertIsNone(ds.out_of_usage("spent"))
+
+    def test_dry_run_claims_nothing(self):
+        self.cut("killed", title="Killed by the sign-out")
+        before = snapshot(self.tmp)
+        rc, out = self.run_cli("restart", "--dry-run")
+        self.assertEqual((rc, snapshot(self.tmp)), (0, before))
+        self.assertFalse(self.state.exists())
+        lines = out.splitlines()
+        self.assertEqual(lines[0], "Chats to restart (cut off in the last 6 hours, app signed in as "
+                                   "work) - dry run, nothing claimed")
+        self.assertEqual(lines[1], "  would be claimed - send each one its message (--json has the text):")
+        self.assertTrue(lines[2].startswith("    Killed by the sign-out - cut off at "))
+        self.assertEqual(lines[3], "      local_killed")
+
+    def test_command_output(self):
+        self.cut("killed", title="Killed by the sign-out")
+        rc, out = self.run_cli("restart", "--json")
+        data = json.loads(out)
+        self.assertEqual((rc, sorted(data), [c["session"] for c in data["chats"]]),
+                         (0, ["account", "chats", "note", "skipped"], ["local_killed"]))
+        rc, out = self.run_cli("restart")
+        self.assertEqual(out.splitlines()[0], "Chats to restart (cut off in the last 6 hours, app "
+                                              "signed in as work)")
+        self.assertIn("  left alone:", out.splitlines())
+        self.assertTrue(out.splitlines()[-1].startswith("    Killed by the sign-out - a restart was "
+                                                        "sent at "))
+        self.cfg["accounts"] = []
+        rc, out = self.run_cli("restart")
+        self.assertEqual(out.splitlines(), ["Chats to restart (cut off in the last 6 hours)",
+                                            "  nothing to restart"])
+        for bad in (("restart", "now"), ("auto-restart", "maybe"), ("auto-restart", "on", "off")):
+            rc, out = self.run_cli(*bad)
+            self.assertEqual((rc, out.startswith("usage: claude-accounts sync")), (2, True), bad)
+
+
+class PickupTaskTest(TasksBase):
+    """With auto-restart on, a pick-up task waits in the other account's task list."""
+
+    def setUp(self):
+        super().setUp()
+        self.cfg["desktop_sync"]["auto_restart"] = True
+        self.sign_in(P_ACCT)
+
+    def pick(self, account):
+        found = [t for t in self.tasks(account) if t["id"] == ds.PICKUP_ID]
+        return found[0] if found else None
+
+    def prompt(self):
+        return self.shared / "scheduled-tasks" / ds.PICKUP_ID / "SKILL.md"
+
+    def test_pick_up_task_waits_on_the_other_account(self):
+        self.put_tasks("personal", [cron_task("mail")])
+        self.put_tasks("work", [cron_task("mail")])
+        before = snapshot(self.dirs["personal"])
+        r = self.sync()
+        self.assertEqual(r["errors"], [])
+        self.assertEqual(snapshot(self.dirs["personal"]), before)     # the signed-in list is only read
+        entry = self.pick("work")
+        now_ms = time.time() * 1000
+        self.assertEqual({k: entry[k] for k in ("displayName", "filePath", "cwd", "permissionMode",
+                                                "permissionModeCarried", "enabled")},
+                         {"displayName": "Pick up after an account switch",
+                          "filePath": str(self.prompt()), "cwd": str(self.home),
+                          "permissionMode": "bypassPermissions", "permissionModeCarried": True,
+                          "enabled": True})
+        self.assertNotIn("lastRunAt", entry)
+        self.assertTrue(0 <= now_ms - entry["fireAt"] < 60000)        # due the moment the app reads it
+        self.assertTrue(ds.desktop_tasks.is_armed(entry, now_ms))
+        self.assertEqual(self.changes(r), [("arm", ds.PICKUP_ID)])
+        self.assertEqual(self.row(r)["only_there"], [])
+        self.assertIn("    arm - Pick up after an account switch (it restarts the chats a sign-out cut "
+                      "off, when the app signs in to work)", ds.report_lines(r))
+        self.assertIn("  work: 1 armed", ds.report_lines(r))
+        # Its instructions are written once, with this copy's command in them.
+        text = self.prompt().read_text()
+        self.assertTrue(text.startswith("---\nname: %s\ndescription: " % ds.PICKUP_ID))
+        self.assertIn("%s sync restart --json" % ds.shlex.quote(str(ds.ACCOUNTS_SCRIPT)), text)
+        self.assertIn("mcp__ccd_session_mgmt__send_message", text)
+        # A second sync changes nothing, and what only that account has is still told apart.
+        snap = snapshot(self.tmp / "desktop")
+        again = self.sync()
+        self.assertEqual(snapshot(self.tmp / "desktop"), snap)
+        self.assertEqual((self.changes(again), self.row(again)["only_there"]), ([], []))
+        rc, out = self.run_cli("status")
+        self.assertIn("  auto-restart - on: chats cut off by a switch restart by themselves when the "
+                      "app signs in to work", out.splitlines())
+        self.assertIn("  scheduled tasks - work matches personal (signed in)", out.splitlines())
+
+    def test_after_it_ran_there_the_other_side_is_armed(self):
+        self.put_tasks("personal", [])
+        self.put_tasks("work", [])
+        self.sync()
+        armed = self.pick("work")
+        # The app is signed in to work: the task starts, and the app marks it as run.
+        fired = dict(armed, enabled=False, lastRunAt="2026-11-23T06:13:40.000Z",
+                     lastScheduledFor="2026-11-23T06:13:35.000Z", promptFileHash="h.h")
+        self.put_tasks("work", [fired])
+        self.sign_in(W_ACCT)
+        before = snapshot(self.dirs["work"])
+        r = self.sync()
+        self.assertEqual(snapshot(self.dirs["work"]), before)
+        entry = self.pick("personal")
+        self.assertEqual(self.changes(r, "personal"), [("arm", ds.PICKUP_ID)])
+        self.assertEqual((entry["enabled"], entry["promptFileHash"], entry["createdAt"]),
+                         (True, "h.h", armed["createdAt"]))
+        self.assertFalse({"lastRunAt", "lastScheduledFor"} & set(entry))
+        self.assertTrue(ds.desktop_tasks.is_armed(entry, time.time() * 1000))
+        self.assertEqual(self.changes(self.sync(), "personal"), [])
+
+    def test_this_accounts_own_copy_is_not_what_the_other_gets(self):
+        # Here it may be a task that is run by hand, made in the app.
+        by_hand = {"id": ds.PICKUP_ID, "displayName": "Pick up (run me)", "enabled": True,
+                   "filePath": "/x/SKILL.md", "createdAt": BASE_MS, "madeByClaude": True}
+        self.put_tasks("personal", [by_hand, cron_task("mail")])
+        self.put_tasks("work", [])
+        r = self.sync()
+        entry = self.pick("work")
+        self.assertEqual(sorted(self.changes(r)), [("add", "mail"), ("arm", ds.PICKUP_ID)])
+        self.assertEqual((entry["displayName"], entry["madeByClaude"], entry["enabled"]),
+                         ("Pick up (run me)", True, True))
+        self.assertTrue(ds.desktop_tasks.is_one_time(entry))
+
+    def test_off_means_switched_off_there(self):
+        self.put_tasks("personal", [])
+        self.put_tasks("work", [])
+        self.sync()
+        self.assertTrue(self.pick("work")["enabled"])
+        self.cfg["desktop_sync"]["auto_restart"] = False
+        r = self.sync()
+        self.assertEqual(self.changes(r), [("disarm", ds.PICKUP_ID)])
+        self.assertEqual(self.pick("work")["enabled"], False)          # switched off, not deleted
+        self.assertIn("    disarm - Pick up after an account switch (auto-restart is off)",
+                      ds.report_lines(r))
+        self.assertEqual(self.changes(self.sync()), [])
+        rc, out = self.run_cli("status")
+        self.assertIn('  auto-restart - off: a chat cut off by a switch waits for a "continue" '
+                      "(claude-accounts sync auto-restart on)", out.splitlines())
+
+    def test_off_and_never_on_writes_nothing(self):
+        self.cfg["desktop_sync"]["auto_restart"] = False
+        self.put_tasks("personal", [cron_task("mail")])
+        self.put_tasks("work", [cron_task("mail")])
+        before = snapshot(self.sessions)
+        self.assertEqual(self.changes(self.sync()), [])
+        self.assertEqual(snapshot(self.sessions), before)
+        self.assertIsNone(self.pick("work"))
+        self.assertFalse(self.prompt().exists())
+
+    def test_an_account_without_usage_is_not_armed(self):
+        self.put_tasks("personal", [])
+        self.put_tasks("work", [])
+        with mock.patch.object(ds, "out_of_usage", return_value="Nov 28, 11:00 PM"):
+            r = self.sync()
+            self.assertEqual(self.changes(r), [])
+            self.assertIsNone(self.pick("work"))
+            rc, out = self.run_cli("status")
+            self.assertIn("  auto-restart - on, but not armed for work: it is out of usage until "
+                          "Nov 28, 11:00 PM", out.splitlines())
+        self.sync()                                                    # usage is back: armed
+        self.assertTrue(self.pick("work")["enabled"])
+        with mock.patch.object(ds, "out_of_usage", return_value="Nov 28, 11:00 PM"):
+            r = self.sync()                                            # used up again: switched off
+        self.assertEqual(self.changes(r), [("disarm", ds.PICKUP_ID)])
+        self.assertIn("    disarm - Pick up after an account switch (work is out of usage until "
+                      "Nov 28, 11:00 PM)", ds.report_lines(r))
+        self.assertFalse(self.pick("work")["enabled"])
+
+    def test_dry_run_arms_nothing(self):
+        self.put_tasks("personal", [])
+        self.put_tasks("work", [])
+        before = snapshot(self.tmp)
+        rc, out = self.run_cli("--dry-run")
+        self.assertEqual((rc, snapshot(self.tmp)), (0, before))
+        self.assertIn("  work: 1 to arm", out.splitlines())
+        self.assertFalse(self.prompt().exists())
+
+    def test_instructions_that_were_edited_are_kept(self):
+        self.prompt().parent.mkdir(parents=True)
+        self.prompt().write_text("my own wording")
+        self.put_tasks("personal", [])
+        self.put_tasks("work", [])
+        self.sync()
+        self.assertEqual(self.prompt().read_text(), "my own wording")
+        self.assertTrue(self.pick("work")["enabled"])
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores folder permissions")
+    def test_no_instructions_no_armed_task(self):
+        self.put_tasks("personal", [])
+        before = self.put_tasks("work", []).read_bytes()
+        (self.shared / "scheduled-tasks").mkdir()
+        os.chmod(str(self.shared / "scheduled-tasks"), 0o500)
+        try:
+            r = self.sync()
+        finally:
+            os.chmod(str(self.shared / "scheduled-tasks"), 0o755)
+        self.assertEqual(self.tasks_path("work").read_bytes(), before)
+        self.assertEqual(len(r["errors"]), 1)
+        self.assertTrue(r["errors"][0].startswith("could not update the scheduled tasks of work: "))
+
+    def test_switching_it_on_and_off(self):
+        self.cfg_path.write_text(json.dumps({"accounts": [], "desktop_sync": {"enabled": True}}))
+        rc, out = self.run_cli("auto-restart", "on")
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(self.cfg_path.read_text())["desktop_sync"],
+                         {"enabled": True, "auto_restart": True})
+        self.assertIn("Set desktop_sync.auto_restart to true in ", out)
+        self.assertIn("The pick-up task's instructions: %s" % ds.tilde(self.prompt()), out)
+        self.assertTrue(self.prompt().exists())
+        rc, out = self.run_cli("auto-restart", "on")
+        self.assertIn("desktop_sync.auto_restart is already true in ", out)
+        rc, out = self.run_cli("auto-restart", "off")
+        self.assertEqual(json.loads(self.cfg_path.read_text())["desktop_sync"],
+                         {"enabled": True, "auto_restart": False})
+        self.assertIn("The next sync switches the waiting pick-up task off.", out)
+        rc, out = self.run_cli("auto-restart")
+        self.assertEqual(out.splitlines()[0], "Restarting chats after a switch")
+        self.assertIn("  auto-restart - on, the next sync arms it for work", out.splitlines())
 
 
 class AppDetectionTest(unittest.TestCase):

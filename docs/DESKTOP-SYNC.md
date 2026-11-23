@@ -269,9 +269,67 @@ the list with each chat's id for a chat that picks the work up. `claude-accounts
 status` says how many chats there are, and `desktop_sync.handover_lines(cfg)` gives the
 list as text lines to other code.
 
-To go on with a chat, open it and say "continue". Nothing does that for you: a turn that
-was cut off in the middle of a step may have finished that step or not, so the chat
-should check before it repeats anything.
+To go on with a chat, open it and say "continue". A turn that was cut off in the middle
+of a step may have finished that step or not, so the chat should check before it repeats
+anything. The app can also send that message by itself after a switch: see the next
+section.
+
+## Restarting cut-off chats by themselves
+
+Off unless you turn it on:
+
+```bash
+claude-accounts sync auto-restart on     # and: off, or no argument to see where it stands
+```
+
+With it on, the chats that a sign-out cut off start again by themselves once the app is
+signed in to the other account. Nothing outside the app can type into a chat, so the
+restart comes from inside it, through the app's own scheduled tasks:
+
+1. **A pick-up task waits in the other account's task list.** Every sync makes sure the
+   task list of each account the app is not signed in to holds a one-time task named
+   "Pick up after an account switch" whose time has already come. The app starts such a
+   task the moment it reads the list, which is when it signs in to that account. This is
+   the one task that is not copied as it is ([scheduled tasks](#scheduled-tasks) rule 2):
+   after it ran on one account, the copy on the other account is armed again.
+2. **The task claims the chats.** Its instructions are one file,
+   `~/.claude/scheduled-tasks/pick-up-after-account-switch/SKILL.md`. It runs
+   `claude-accounts sync restart --json`, which lists the chats to restart and marks each
+   one as taken (`desktop-sync/restarts.json` in the state folder).
+3. **Each claimed chat gets one message**, about a minute apart: it was cut off by the
+   switch, it should first check what already happened so that nothing is done or sent
+   twice, and then carry on. The chat continues under its own settings, in the app, as
+   the same chat.
+
+What `sync restart` hands out, and what it never does:
+
+- **Only a chat that was cut off in the middle of a turn** in the last 6 hours, with no
+  process left ([the same test as the list above](#picking-up-after-a-switch)). It looks
+  twice, 5 seconds apart, and leaves a chat alone that moved in between.
+- **Never a chat twice.** A claim stands for 15 minutes or until the chat moves on, so a
+  second run, or another helper that reads `sync handover`, sees "restart sent".
+- **Never a chat that was continued elsewhere**: one the StopFailure hook handed to
+  Terminal since it stopped (a `handoff` event in the event log), or one that has a fork.
+- **Never a turn that ended at a usage limit.** That is the hook's case, and the chat is
+  listed as stopped, not cut off.
+- **Never a scheduled run** (the task runs again on its schedule) and never a chat that
+  waits for you: those need your answer.
+- **Not on an account that is out of usage.** When the switch helper's last usage reading
+  says an account has used up its week, the pick-up task is not armed there, and `sync
+  restart` hands out nothing while the app is signed in to it.
+
+What to know before turning it on:
+
+- The pick-up task runs in bypass mode, because nobody is there to approve its messages
+  to the other chats. Its instructions can be edited; sync writes the file only when it
+  is missing.
+- The restarted chats use the new account's usage, and they all start within minutes of
+  the sign-in.
+- It rests on how the app stores and starts scheduled tasks, which is not a documented
+  interface. If the task does not start, nothing is lost: `claude-accounts sync handover`
+  still lists the chats.
+- Turning it off (`claude-accounts sync auto-restart off`) switches the waiting task off
+  at the next sync. It is never deleted by sync; delete it in the app if you want it gone.
 
 ## A sync at sign-out
 
@@ -299,6 +357,7 @@ claude-accounts sync install          # sync every 10 minutes in the background
 claude-accounts sync install --every 5
 claude-accounts sync status           # the background job, the last run, do the lists match
 claude-accounts sync handover         # the chats that were left in the middle of their work
+claude-accounts sync auto-restart on  # have the app restart the cut-off ones after a switch
 claude-accounts sync uninstall        # stop the background job
 ```
 
@@ -362,6 +421,8 @@ transcript, which `claude --resume` lists.
 - **Stop copying the task backlog** - set `"desktop_sync": {"backlog": false}`. Its
   backups are next to the task-list backups, named `backlog.<date>-<time>.json`, and go
   back the same way, over `backlog/tasks.json` in the account's folder.
+- **Stop the automatic restarts** - `claude-accounts sync auto-restart off`. The next sync
+  switches the waiting pick-up task off.
 - **Stop the sync at sign-out** - it is part of the background job. `claude-accounts sync
   uninstall` removes the job, and with it the sync on its interval.
 - **Put a task list back** - every list sync replaced has copies in
@@ -406,8 +467,9 @@ transcript, which `claude --resume` lists.
   minutes before you switch may not have reached the other account: a run from those
   minutes can repeat once, and a new task stays with the old account, where sync reports
   it. Running `claude-accounts sync` just before you sign out avoids both.
-- **Chats cut off by a switch stay cut off** until someone continues them.
-  `claude-accounts sync handover` lists them. It cannot tell whether the step a chat was
-  in the middle of had finished.
+- **Chats cut off by a switch stay cut off** until someone continues them, or, with
+  [auto-restart](#restarting-cut-off-chats-by-themselves) on, until the pick-up task does.
+  `claude-accounts sync handover` lists them. Nothing can tell whether the step a chat was
+  in the middle of had finished, so a restarted chat is told to check first.
 - **Scheduled tasks run under whichever account is signed in.** After a switch the copied
   tasks use that account's usage, connectors and permissions.

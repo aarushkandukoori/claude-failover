@@ -29,6 +29,7 @@ INTERRUPTED = "[Request interrupted by user"
 LOCAL_OUTPUT = ("<local-command", "<command-name>", "<command-message>", "<command-args>",
                 "<bash-input>", "<bash-stdout>", "<bash-stderr>")
 NEW_CHAT_SLACK = 120   # seconds between a new chat's process start and its transcript's birth
+CLAIM_MINUTES = 15     # a restart that was claimed but never came may be claimed again after this
 
 
 def blocks(entry):
@@ -136,3 +137,28 @@ def is_alive(cli_id, born, running):
     if cli_id in ids:
         return True
     return born is not None and any(abs(born - start) <= NEW_CHAT_SLACK for start in starts)
+
+
+def claim_is_live(claim, cut_at, now):
+    """True while a claim on a chat stands. Whoever restarts a cut-off chat claims
+    it first, so that two helpers never both send it "continue". A claim is for
+    one cut (`cut_at`, the time of the chat's last entry): once the chat moves
+    on and is cut off again, that is a new cut. And it lasts CLAIM_MINUTES, in
+    case the restart was claimed but never sent. `now` in unix seconds."""
+    if not isinstance(claim, dict) or claim.get("cut_at") != cut_at:
+        return False
+    at = claim.get("claimed_at")
+    return (isinstance(at, (int, float)) and not isinstance(at, bool)
+            and 0 <= now - at < CLAIM_MINUTES * 60)
+
+
+def restart_message(when, detail):
+    """What a cut-off chat is told when it is restarted. `when` = the time of the
+    cut as text, `detail` = the step it was in, or ""."""
+    step = " The last step you had started: %s." % detail if detail else ""
+    return ("Automatic pick-up after an account switch: your last turn was cut off at %s, when the "
+            "Claude app was signed out.%s The app is now signed in to another account, so carry on "
+            "and finish what you were doing. First check what already happened, so that nothing is "
+            "done or sent twice: a command you had started may have finished or died, and files, "
+            "commits, emails or messages from before the cut are already out. Then continue from "
+            "where it stopped." % (when, step))

@@ -33,6 +33,9 @@ import datetime as dt
 import json
 
 RUN_FIELDS = ("lastRunAt", "lastScheduledFor")   # what the app writes when a task runs
+# What a copy of the pick-up task keeps from an older entry. When it runs is set anew.
+PICKUP_KEEP = ("id", "displayName", "filePath", "createdAt", "cwd", "model", "permissionMode",
+               "permissionModeCarried", "madeByClaude", "promptWrittenBy", "promptFileHash")
 
 
 class NotATaskList(Exception):
@@ -218,3 +221,42 @@ def plan(source, target, now_ms):
     only_there = [{"id": t["id"], "name": label(t), "live": is_live(t)}
                   for t in theirs if t["id"] not in source_ids and t["id"] not in twins]
     return theirs, changes, only_there
+
+
+def is_armed(task, now_ms):
+    """A one-time task the app starts as soon as it reads the list: it is on, it
+    never ran, and its time has come."""
+    return is_one_time(task) and is_live(task) and task["fireAt"] <= now_ms
+
+
+def pickup_plan(mine, theirs, base, want_armed, now_ms):
+    """What the other account's copy of the pick-up task should be. That task
+    restarts the chats a sign-out cut off, and it has to start by itself when
+    the app signs in to the other account. So unlike every other task its copy
+    there is not what the signed-in account holds: it is kept armed, a one-time
+    task whose time has come, whatever became of the copy here.
+
+    mine        the signed-in account's entry for the task, or None
+    theirs      the other account's entry, or None
+    base        the fields a fresh entry starts from (id, displayName, filePath, ...)
+    want_armed  True = it should start at the next sign-in there, False = it must not
+
+    Returns (entry, action): the other account's entry as it should be (None for
+    no entry) and "arm", "disarm" or None when it is already right. No input is
+    changed."""
+    if not want_armed:
+        if theirs is not None and theirs.get("enabled") is True:
+            return dict(copy.deepcopy(theirs), enabled=False), "disarm"
+        return (copy.deepcopy(theirs) if theirs is not None else None), None
+    if theirs is not None and is_armed(theirs, now_ms):
+        return copy.deepcopy(theirs), None
+    merged = dict(base)
+    for older in (theirs, mine):   # the signed-in account's settings count most
+        merged.update({k: copy.deepcopy(v) for k, v in (older or {}).items() if k in PICKUP_KEEP})
+    entry = {k: merged[k] for k in PICKUP_KEEP if k in merged}
+    made = entry.get("createdAt")
+    if isinstance(made, bool) or not isinstance(made, (int, float)):
+        entry["createdAt"] = int(now_ms)
+    entry["fireAt"] = int(now_ms) - 1000   # a moment ago: due the instant the app reads the list
+    entry["enabled"] = True
+    return entry, "arm"
