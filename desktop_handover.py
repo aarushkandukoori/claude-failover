@@ -30,6 +30,7 @@ LOCAL_OUTPUT = ("<local-command", "<command-name>", "<command-message>", "<comma
                 "<bash-input>", "<bash-stdout>", "<bash-stderr>")
 NEW_CHAT_SLACK = 120   # seconds between a new chat's process start and its transcript's birth
 CLAIM_MINUTES = 15     # a restart that was claimed but never came may be claimed again after this
+SYNTHETIC = "<synthetic>"   # the "model" of an assistant entry the CLI wrote itself
 
 
 def blocks(entry):
@@ -53,16 +54,24 @@ def has_block(entry, kind):
 
 def is_conversation(entry):
     """True for an entry of the main conversation: a prompt, a reply, a tool call
-    or a tool result. Subagent entries, notes the app adds and the output of
-    slash commands are not part of what the turn is waiting for."""
+    or a tool result. Subagent entries, the CLI's own filler replies and the
+    output of slash commands are not part of what the turn is waiting for."""
     if not isinstance(entry, dict) or entry.get("type") not in ("user", "assistant"):
         return False
-    if entry.get("isSidechain") or entry.get("isMeta") or not isinstance(entry.get("message"), dict):
+    message = entry.get("message")
+    if entry.get("isSidechain") or not isinstance(message, dict):
         return False
-    if entry["type"] == "user" and not has_block(entry, "tool_result"):
-        if text_of(entry).startswith(LOCAL_OUTPUT):
-            return False
-    return True
+    if entry["type"] == "assistant":
+        # Before a message that restarts a chat, the CLI writes a filler reply itself
+        # ("No response requested."). That is no reply. An error message is written
+        # the same way, and that one does end the turn.
+        return message.get("model") != SYNTHETIC or bool(entry.get("isApiErrorMessage"))
+    if has_block(entry, "tool_result"):
+        return True
+    # A message from another chat, a skill's text or an attached picture is marked
+    # isMeta and still is a prompt the chat answers. Only what a local command
+    # printed is not.
+    return not text_of(entry).startswith(LOCAL_OUTPUT)
 
 
 def last_tool(entries):

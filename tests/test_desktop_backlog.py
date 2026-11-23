@@ -91,11 +91,41 @@ class ItemTest(unittest.TestCase):
 class PlanTest(unittest.TestCase):
 
     def plan(self, source, target, seen=None):
-        """plan(), with a check that it never changes what it was given."""
+        """plan() without its list of items that found no room, with a check that it
+        never changes what it was given."""
+        return self.full_plan(source, target, seen)[:4]
+
+    def full_plan(self, source, target, seen=None):
         before = copy.deepcopy((source, target, seen))
         out = db.plan(source, target, seen, NOW)
         self.assertEqual((source, target, seen), before)
         return out
+
+    def test_the_other_list_is_never_filled_past_what_the_app_keeps(self):
+        # The app keeps 20 items per folder and drops the oldest beyond that at its next
+        # save. Ten of the other account's own items share the folder: only ten more fit,
+        # or the app would throw out that account's own.
+        own = [item("own%02d" % i, age_days=20, filedAt=NOW - 20 * DAY + i) for i in range(10)]
+        mine = [item("new%02d" % i, age_days=2, filedAt=NOW - 2 * DAY + i) for i in range(15)]
+        new, added, removed, only_there, no_room = self.full_plan(mine, own)
+        self.assertEqual((len(new), len(added), removed, only_there), (20, 10, [], 10))
+        self.assertEqual(new[:10], own)                               # all of its own are still there
+        self.assertEqual(added, ["Task new%02d" % i for i in range(5, 15)])   # the newest ten, in order
+        self.assertEqual(no_room, ["Task new%02d" % i for i in range(5)])
+        # Another folder has room of its own, and a folder is the same folder however it is spelled.
+        elsewhere = [item("else", cwd="/Users/me/other")]
+        respelled = [item("slash", cwd="/Users/me/proj/"), item("upper", cwd="/Users/Me/Proj")]
+        _new, added, _r, _o, no_room = self.full_plan(elsewhere + respelled, new)
+        self.assertEqual((added, no_room), (["Task else"], ["Task slash", "Task upper"]))
+
+    def test_at_most_100_items_in_all(self):
+        full = [item("t%03d" % i, cwd="/f/%d" % (i // 10)) for i in range(100)]
+        new, added, _r, _o, no_room = self.full_plan([item("one more", cwd="/somewhere/new")], full)
+        self.assertEqual((len(new), added, no_room), (100, [], ["Task one more"]))
+        # Items the app is about to drop for their age do not take up room.
+        aged = [dict(i, suggestedAt=NOW - 40 * DAY) for i in full[:1]] + full[1:]
+        _new, added, _r, _o, no_room = self.full_plan([item("one more", cwd="/somewhere/new")], aged)
+        self.assertEqual((added, no_room), (["Task one more"], []))
 
     def test_missing_items_are_added(self):
         own = item("theirs")
@@ -142,8 +172,8 @@ class PlanTest(unittest.TestCase):
         seen = [key("started"), key("a")]
         new, added, removed, only_there = self.plan(source, target, seen)
         self.assertEqual((added, removed), (["Task a", "Task b"], ["Task started"]))
-        again = self.plan(source, new, db.keys(source))
-        self.assertEqual(again, (new, [], [], only_there))
+        again = self.full_plan(source, new, db.keys(source))
+        self.assertEqual(again, (new, [], [], only_there, []))
 
     def test_after_a_switch_the_other_account_leads(self):
         # A is signed in: its item reaches B. Then the app switches to B and the

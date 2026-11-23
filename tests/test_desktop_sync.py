@@ -1690,8 +1690,8 @@ def later(name, age_days=1, **more):
     return data
 
 
-class BacklogTest(TasksBase):
-    """The signed-in account's task backlog is mirrored into the other account's file."""
+class BacklogBase(TasksBase):
+    """Accounts with a task backlog file each."""
 
     def backlog_path(self, account):
         return self.dirs[account] / "backlog" / "tasks.json"
@@ -1717,6 +1717,10 @@ class BacklogTest(TasksBase):
     def backlog_backups(self, acct=W_ACCT, org=W_ORG):
         d = self.state / "desktop-sync" / "task-backups" / acct / org
         return sorted(p for p in d.iterdir() if p.name.startswith("backlog.")) if d.is_dir() else []
+
+
+class BacklogTest(BacklogBase):
+    """The signed-in account's task backlog is mirrored into the other account's file."""
 
     def test_items_reach_the_other_account(self):
         a, b = later("a"), later("b", title="Café fix")
@@ -1801,14 +1805,68 @@ class BacklogTest(TasksBase):
         self.assertEqual(self.titles("work"), ["Later a", "Later b"])
         self.sign_in(W_ACCT)
         self.assertEqual(self.brow(self.sync(), "personal")["removed"], [])     # nothing changed yet
-        # Started on the account the app is on now, and one new item filed there.
+        # The app, now on work, files a new item: its save keeps a and b, so it has them.
+        self.put_backlog("work", [later("a"), later("b"), later("c")])
+        r = self.sync()
+        self.assertEqual((self.brow(r, "personal")["added"], self.brow(r, "personal")["removed"]),
+                         (["Later c"], []))
+        # Then a is started there: the app takes it off its list, and it leaves the other list too.
         self.put_backlog("work", [later("b"), later("c")])
         before = snapshot(self.dirs["work"])
         r = self.sync()
         self.assertEqual(snapshot(self.dirs["work"]), before)
         self.assertEqual(self.titles("personal"), ["Later b", "Later c"])
         row = self.brow(r, "personal")
-        self.assertEqual((row["added"], row["removed"]), (["Later c"], ["Later a"]))
+        self.assertEqual((row["added"], row["removed"]), ([], ["Later a"]))
+
+    def test_cards_the_app_never_took_are_not_deleted(self):
+        # The sync wrote a and b into work's list. Then the app signs in to work and saves a
+        # copy of the list that does not have them: it had read the file before that write,
+        # or it dropped them to make room. Nobody started a or b, so they must stay on
+        # personal, however many syncs looked at work's file in between.
+        self.put_backlog("personal", [later("a"), later("b")])
+        self.put_backlog("work", [later("own")])
+        self.sign_in(P_ACCT)
+        self.sync()
+        self.sync()
+        self.assertEqual(self.titles("work"), ["Later own", "Later a", "Later b"])
+        self.sign_in(W_ACCT)
+        r = self.sync()                               # work's file is still what the sync wrote
+        self.assertEqual(self.brow(r, "personal")["added"], ["Later own"])
+        self.put_backlog("work", [later("own")])      # the app's save: a and b are not in it
+        r = self.sync()
+        row = self.brow(r, "personal")
+        self.assertEqual((row["removed"], row["added"]), ([], []))
+        self.assertEqual(self.titles("personal"), ["Later a", "Later b", "Later own"])
+        self.assertEqual(self.brow(self.sync(), "personal")["removed"], [])
+        # Back on personal they are simply copied to work again.
+        self.sign_in(P_ACCT)
+        self.sync()
+        self.assertEqual(sorted(self.titles("work")), ["Later a", "Later b", "Later own"])
+
+    def test_a_full_folder_gets_no_more(self):
+        # The app keeps 20 items per folder. Work has 19 of its own in this one.
+        own = [later("own%02d" % i, age_days=10) for i in range(19)]
+        self.put_backlog("personal", [later("old", age_days=5), later("mid", age_days=3),
+                                      later("new", age_days=1)])
+        self.put_backlog("work", own)
+        self.sign_in(P_ACCT)
+        r = self.sync()
+        row = self.brow(r)
+        self.assertEqual((row["added"], row["skipped"], row["only_there"]),
+                         (["Later new"], ["Later old", "Later mid"], 19))
+        self.assertEqual(self.titles("work"), ["Later own%02d" % i for i in range(19)] + ["Later new"])
+        lines = ds.report_lines(r)
+        self.assertIn("  work: 1 added, 2 not copied (no room)", lines)
+        self.assertIn("    not copied - Later old (its folder or the whole list is full: the app keeps "
+                      "20 items per folder and 100 in all)", lines)
+        # Nothing more to write, and it keeps saying what does not fit.
+        again = self.sync()
+        self.assertEqual((self.brow(again)["added"], self.brow(again)["written"],
+                          self.brow(again)["skipped"]), ([], False, ["Later old", "Later mid"]))
+        rc, out = self.run_cli("status")
+        self.assertIn("  task backlog - 2 items of personal do not fit on work (the app keeps 20 items "
+                      "per folder and 100 in all)", out.splitlines())
 
     def test_account_without_a_backlog_gets_one(self):
         a = later("a")
@@ -1950,6 +2008,56 @@ class BacklogTest(TasksBase):
             r = self.sync()
         self.assertTrue(self.has("work", "s1"))
         self.assertEqual(r["errors"], ["the task backlog was not copied: boom"])
+
+
+class OrgNotNamedBacklogTest(BacklogBase):
+    """The same doubt for the backlog: which organization folder does the app read?"""
+
+    def setUp(self):
+        super().setUp()
+        for acct in self.cfg["accounts"]:
+            acct["desktop_org_uuid"] = None
+        self.record("personal", "s1")    # the folder with a chat is the one sync picks
+        self.record("work", "s1")
+        self.put_backlog("personal", [later("a")])
+        self.put_backlog("work", [later("own")])
+        self.sign_in(P_ACCT)
+
+    def other_org(self, acct, org, items):
+        d = self.sessions / acct / org / "backlog"
+        d.mkdir(parents=True)
+        (d / "tasks.json").write_text(json.dumps({"version": 1, "items": items}, separators=(",", ":")))
+
+    def test_an_empty_backlog_in_another_org_folder_changes_nothing(self):
+        self.other_org(P_ACCT, W_ORG, [])
+        self.other_org(W_ACCT, P_ORG, [])
+        r = self.sync()
+        self.assertEqual((r["errors"], self.brow(r)["added"]), ([], ["Later a"]))
+        self.assertEqual(self.titles("work"), ["Later own", "Later a"])
+
+    def test_signed_in_account_with_a_backlog_in_two_org_folders_copies_nothing(self):
+        self.other_org(P_ACCT, P_ORG2, [later("maybe-the-real-list")])
+        before = snapshot(self.sessions)
+        r = self.sync()
+        self.assertEqual(snapshot(self.sessions), before)
+        self.assertEqual((r["backlog"]["source"], r["backlog"]["targets"]), (None, []))
+        self.assertEqual(r["backlog"]["note"], "personal is signed in and has a backlog in more than "
+                                               "one organization folder")
+        self.assertIn("Task backlog - not copied: %s" % r["backlog"]["note"], ds.report_lines(r))
+        # Naming the folder in the config settles it.
+        self.cfg["accounts"][0]["desktop_org_uuid"] = P_ORG
+        self.assertEqual(self.brow(self.sync())["added"], ["Later a"])
+
+    def test_other_account_with_a_backlog_in_two_org_folders_is_left_alone(self):
+        self.other_org(W_ACCT, P_ORG2, [later("maybe-the-real-list")])
+        before = snapshot(self.sessions)
+        r = self.sync()
+        self.assertEqual(snapshot(self.sessions), before)
+        row = self.brow(r)
+        self.assertEqual((row["note"], row["added"], row["written"]),
+                         ("it has a backlog in more than one organization folder", [], False))
+        self.assertIn("  work: left alone - it has a backlog in more than one organization folder",
+                      ds.report_lines(r))
 
 
 def said(text, at, **more):
@@ -2118,6 +2226,55 @@ class HandoverTest(ChatsBase):
         with mock.patch.object(ds.os, "scandir", side_effect=scandir):
             self.assertEqual(self.states(), [("local_stays", "cut_off")])
 
+    def test_a_chat_that_is_trying_again_after_an_error_is_not_called_stopped(self):
+        # After a passing error (the Mac slept mid-reply) Claude Code goes on by itself.
+        def error(seconds_ago):
+            at = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=seconds_ago)).strftime(
+                "%Y-%m-%dT%H:%M:%S.000Z")
+            return answered("API Error: Your computer went to sleep mid-response.", at,
+                            stop="stop_sequence", isApiErrorMessage=True)
+
+        self.chat("retrying", [said("go", self.A), error(20)])
+        self.chat("gave-up", [said("go", self.A), error(20)])
+        self.chat("long-ago", [said("go", self.A), error(900)])
+        limit = answered("You've hit your weekly limit \u00b7 resets Sat 11pm",
+                         error(20)["timestamp"], stop="stop_sequence", isApiErrorMessage=True)
+        self.chat("limit", [said("go", self.A), limit])
+        os.environ["CLAUDE_FAILOVER_RUNNING_CHATS"] = "cli-retrying,cli-long-ago,cli-limit"
+        self.assertEqual(sorted(self.states()), [("local_gave-up", "failed"),      # no process: it stopped
+                                                 ("local_limit", "failed"),        # a limit is the end
+                                                 ("local_long-ago", "failed")])    # no new try for minutes
+
+    def test_a_chat_restarted_by_a_message_is_working_or_cut_off_again(self):
+        # What the CLI writes when another chat (or the pick-up task) says "continue".
+        filler = answered("No response requested.", self.B, stop="stop_sequence")
+        filler["message"]["model"] = "<synthetic>"
+        message = said("Another Claude session sent a message: carry on", self.C, isMeta=True)
+        entries = [said("go", self.A), called("Bash", "Run the build", self.A),
+                   returned("Exit code 137", self.A), filler, message]
+        self.chat("restarted", entries, lastAssistantUuid="u1", postTurnSummaryFor="u1",
+                  postTurnSummary={"status_category": "blocked", "needs_action": "an older question"})
+        os.environ["CLAUDE_FAILOVER_RUNNING_CHATS"] = "cli-restarted"
+        self.assertEqual(self.states(), [])              # it is working: not waiting, not cut off
+        os.environ["CLAUDE_FAILOVER_RUNNING_CHATS"] = ""
+        chats = ds.handover(self.cfg)["chats"]           # cut off again before its first reply
+        self.assertEqual([(c["session"], c["state"]) for c in chats], [("local_restarted", "cut_off")])
+        self.assertEqual(chats[0]["at"], cf.iso(cf.parse_iso(self.C).astimezone(cf.LOCAL_TZ)))
+
+    def test_archived_on_one_account_is_not_listed_from_the_other(self):
+        # Archived under the signed-in account. The other account's copy, not synced yet,
+        # has the same activity and still says it is not archived.
+        self.cut_off("archived", account="personal")
+        newer_file = self.record("work", "archived", transcript=False, isArchived=True)
+        soon = time.time() + 5
+        os.utime(str(newer_file), (soon, soon))
+        self.cut_off("kept", account="personal")
+        self.assertEqual(self.states(), [("local_kept", "cut_off")])
+        # And the other way round: brought back after the other copy was archived.
+        older = time.time() - 600
+        os.utime(str(newer_file), (older, older))
+        self.assertEqual(sorted(self.states()), [("local_archived", "cut_off"), ("local_kept", "cut_off")])
+
     def test_without_a_process_list_nothing_is_called_cut_off(self):
         self.cut_off("maybe")
         self.done("blocked", lastAssistantUuid="u1", postTurnSummaryFor="u1",
@@ -2156,6 +2313,7 @@ class HandoverTest(ChatsBase):
             "   00:07 /opt/homebrew/bin/claude --session-id=11112222-3333 -p hi",
             "   00:09 /usr/bin/python3 notes.py --resume=not-a-claude-process",
             "   00:11 /opt/homebrew/bin/claude -p hi",
+            "   03:00 %s --version" % app,       # the app's claude, but not a chat's process
             "garbage line",
             ""])
         ids, starts = ds.parse_ps(text, 100000.0)
@@ -2300,6 +2458,19 @@ class RestartTest(ChatsBase):
                           returned("Exit code 137", self.recent(90))):
                 f.write(json.dumps(entry) + "\n")
         self.assertEqual([c["session"] for c in ds.restart_claims(self.cfg)["chats"]], ["local_killed"])
+
+    def test_a_restart_that_died_before_its_first_reply_can_be_claimed_again(self):
+        path = self.cut("killed", self.recent(600))
+        self.assertEqual(len(ds.restart_claims(self.cfg)["chats"]), 1)
+        # The message arrived, and then the chat was cut off again before it answered.
+        filler = answered("No response requested.", self.recent(500), stop="stop_sequence")
+        filler["message"]["model"] = "<synthetic>"
+        with open(str(path), "a") as f:
+            f.write(json.dumps(filler) + "\n")
+            f.write(json.dumps(said("Automatic pick-up after an account switch: ...",
+                                    self.recent(500), isMeta=True)) + "\n")
+        r = ds.restart_claims(self.cfg)
+        self.assertEqual(([c["session"] for c in r["chats"]], r["skipped"]), (["local_killed"], []))
 
     def test_chats_that_are_left_alone(self):
         at = self.recent(120)

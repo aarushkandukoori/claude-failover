@@ -96,11 +96,35 @@ class TailStateTest(unittest.TestCase):
                                "detail": "You've hit your weekly limit · resets Sat 11pm "
                                          "(America/New_York)"})
 
+    def test_a_filler_entry_is_not_a_reply(self):
+        # When a message from another chat (or a skill) restarts a chat, the CLI first
+        # writes a filler "No response requested." and then the message, marked isMeta.
+        # Neither means the turn ended: until its first real reply the chat is working
+        # on that prompt, and if it dies there it is cut off.
+        filler = reply("No response requested.", at=T2, stop="stop_sequence")
+        filler["message"]["model"] = "<synthetic>"
+        message = prompt("Another Claude session sent a message: carry on", at=T3, isMeta=True)
+        cut = [prompt(), tool_call(at=T1), tool_result(at=T1)]
+        self.assertEqual(self.state(cut + [filler, message]),
+                         {"state": dh.CUT_OFF, "at": T3, "detail": ""})
+        # The filler alone changes nothing: the chat is still cut off where it was.
+        self.assertEqual(self.state(cut + [filler]),
+                         {"state": dh.CUT_OFF, "at": T1, "detail": "Bash - Run the tests"})
+        # A skill started with a slash command: its body is the prompt.
+        skill = [prompt("<command-message>review</command-message>", at=T3),
+                 prompt("Base directory for this skill: /x\n\nDo the review.", at=T3, isMeta=True)]
+        self.assertEqual(self.state([prompt(), reply(at=T2)] + skill)["state"], dh.CUT_OFF)
+        # An error message is written the same way, and it still is a failed turn.
+        error = reply("API Error: 529 Overloaded", at=T3, stop="stop_sequence", isApiErrorMessage=True)
+        error["message"]["model"] = "<synthetic>"
+        self.assertEqual(self.state(cut + [error])["state"], dh.FAILED)
+
     def test_what_is_not_the_conversation_does_not_count(self):
         done = [prompt(), reply(at=T2)]
         after = [tool_call(at=T3, isSidechain=True),                     # a subagent's call
                  tool_result(at=T3, isSidechain=True),
-                 prompt("<system-reminder>note</system-reminder>", at=T3, isMeta=True),
+                 prompt("<local-command-caveat>The command below was run by the user</local-command-caveat>",
+                        at=T3, isMeta=True),
                  prompt("<local-command-stdout>Set model to opus</local-command-stdout>", at=T3),
                  prompt("<command-name>/model</command-name>", at=T3),
                  prompt("<bash-input>ls</bash-input>", at=T3),

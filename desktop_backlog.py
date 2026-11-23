@@ -23,12 +23,20 @@ The rules, all in plan():
 - An item only the other account has, and the signed-in account never had,
   stays where it is.
 - Items older than 30 days are not copied: the app drops those itself.
+- The other list is never filled past what the app keeps (20 items per folder,
+  100 in all). The app would make room at its next save by dropping the oldest
+  items, and those could be that account's own.
 """
 
+import collections
 import copy
 import json
+import posixpath
+import unicodedata
 
 MAX_AGE_MS = 30 * 24 * 3600 * 1000   # the app forgets a proposal this long after it was made
+FOLDER_CAP = 20                      # the app keeps this many items per folder,
+TOTAL_CAP = 100                      # and this many in all: at a save it drops the oldest beyond that
 NEWEST_VERSION = 1                   # the file format this module knows
 
 
@@ -92,6 +100,24 @@ def is_fresh(item, now_ms):
             and now_ms - made < MAX_AGE_MS)
 
 
+def folder(item):
+    """The folder an item belongs to, spelled the way the app compares folders:
+    no slash at the end, letter case ignored."""
+    cwd = item.get("cwd")
+    if not isinstance(cwd, str) or not cwd:
+        return ""
+    return unicodedata.normalize("NFC", posixpath.normpath(cwd)).lower()
+
+
+def filed(item):
+    """When an item was put into the backlog (ms), 0 when it does not say."""
+    for name in ("filedAt", "suggestedAt"):
+        value = item.get(name)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return value
+    return 0
+
+
 def label(item):
     """The item's title for people, else its id."""
     for name in ("title", "id"):
@@ -110,9 +136,11 @@ def plan(source, target, seen, now_ms):
              None when that is not known (then nothing is removed)
     now_ms   the time now, in ms like suggestedAt
 
-    Returns (new target list, added, removed, only_there):
+    Returns (new target list, added, removed, only_there, no_room):
       added, removed   the titles of the items added to / removed from the target
       only_there       how many items stay that only the other account has
+      no_room          the titles of the items that were not added because the
+                       target's folder or the whole list is full
     Neither input list is changed.
     """
     here = {key(item) for item in source} - {None}
@@ -125,14 +153,30 @@ def plan(source, target, seen, now_ms):
             kept.append(copy.deepcopy(item))
     there = {key(item) for item in kept}
     ids = {item.get("id") for item in kept}
-    added = []
+    wanted = []
     for item in source:
         k = key(item)
         if k is None or k in there or item.get("id") in ids or not is_fresh(item, now_ms):
             continue
-        kept.append(copy.deepcopy(item))
+        wanted.append(item)
         there.add(k)
         ids.add(item.get("id"))
-        added.append(label(item))
+    # How full the target is, the way the app counts: items it is about to drop for
+    # their age take up no room. What room there is goes to the newest items first.
+    counted = [item for item in kept if is_fresh(item, now_ms)]
+    in_folder = collections.Counter(folder(item) for item in counted)
+    total, fits = len(counted), set()
+    for item in sorted(wanted, key=filed, reverse=True):
+        if total < TOTAL_CAP and in_folder[folder(item)] < FOLDER_CAP:
+            fits.add(key(item))
+            in_folder[folder(item)] += 1
+            total += 1
+    added, no_room = [], []
+    for item in wanted:
+        if key(item) in fits:
+            kept.append(copy.deepcopy(item))
+            added.append(label(item))
+        else:
+            no_room.append(label(item))
     only_there = sum(1 for item in kept if key(item) not in here)
-    return kept, added, removed, only_there
+    return kept, added, removed, only_there, no_room

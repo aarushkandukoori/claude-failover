@@ -112,6 +112,7 @@ To remove it: `claude-accounts hook uninstall`, `claude-accounts sync uninstall`
 | `claude-accounts sync [--dry-run] [--quiet] [--json]` | Sync desktop app chats and scheduled tasks once. `--dry-run` prints what would change and writes nothing. |
 | `claude-accounts sync install [--every MINUTES]`, `sync uninstall`, `sync status` | Sync in the background with a LaunchAgent: every 10 minutes by default, and whenever the app is signed out or in. `sync status` also says whether the scheduled task lists and the task backlogs match, and how many chats there are to pick up. |
 | `claude-accounts sync handover [--json] [--hours N]` | List the chats that were left in the middle of their work in the last 48 hours: cut off by a sign-out, stopped at a usage limit, or waiting for you. It only reads. |
+| `claude-accounts sync auto-restart [on\|off]` | Have the app restart the chats a sign-out cut off, by itself, after a switch. Off by default. `sync restart [--json] [--dry-run]` is the step its pick-up task runs: it claims each cut-off chat once and prints the message to send it. |
 
 For a single call, `CLAUDE_FAILOVER_ACCOUNT=<name>` pins one account, `CLAUDE_FAILOVER=off` turns failover off and uses the first account of the chat order, and `CLAUDE_FAILOVER_VERBOSE=1` prints failover notes on stderr. Every variable is listed in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#configuration).
 
@@ -150,6 +151,8 @@ It lists three kinds of chats from the last 48 hours:
 - **Waiting for you** - the turn ended with a question to you.
 
 To go on with a chat, open it and say "continue". A chat in the app can send that message to the other chats for you, and `--json` gives it their ids. The command only reads: chat records, the ends of transcripts and the process list.
+
+With `claude-accounts sync auto-restart on` the app does that by itself: a pick-up task waits in the other account's task list, starts when the app signs in there, and sends each chat the sign-out cut off one message to check what already happened and then carry on. It never restarts a chat twice, a chat the hook handed to Terminal, a scheduled run, or a chat that waits for you. It is off unless you turn it on: [docs/DESKTOP-SYNC.md](docs/DESKTOP-SYNC.md#restarting-cut-off-chats-by-themselves).
 
 Two more things make the next account start complete. The **task backlog**, the task cards a chat proposed and you set aside, is one list per account, so every sync copies the signed-in account's items into the other accounts and removes the ones you started or dropped. And the background job also runs **the moment the app is signed out**, so chats and tasks from the last minutes are in the other account's folder before the app reads it. Details: [docs/DESKTOP-SYNC.md](docs/DESKTOP-SYNC.md#picking-up-after-a-switch).
 

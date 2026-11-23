@@ -214,12 +214,18 @@ proposed.
 The rules. All of them are in `desktop_backlog.py`.
 
 1. **The signed-in account's list is the source** and is only read.
-2. **Missing: added.** An item the other account lacks is added, unless it is older than
-   30 days.
-3. **Started or dropped: removed.** Sync remembers which items each list held at the last
-   sync. An item that was on the signed-in account's list then and is gone now was
-   started or dropped there, so it is removed from the other account's list too.
-   Otherwise it would come back after a switch and invite doing the work twice. Nothing
+2. **Missing: added, while there is room.** An item the other account lacks is added,
+   unless it is older than 30 days. The app keeps 20 items per folder and 100 in all, and
+   at a save it drops the oldest beyond that. So sync never fills a list past those
+   numbers: the newest items get the room, and the rest are reported as not copied.
+   Otherwise the app would make room by dropping that account's own items.
+3. **Started or dropped: removed.** Sync remembers which items each account's list held.
+   An item the signed-in account held and no longer has was started or dropped there, so
+   it is removed from the other account's list too. Otherwise it would come back after a
+   switch and invite doing the work twice. An account holds an item only once the app
+   itself has saved that account's list with the item in it. An item that sync wrote into
+   a list, and that the app then never took over (it had read the file before the write,
+   or it made room), was not started there: it stays on the account it came from. Nothing
    is removed on the first sync, and nothing when the signed-in account has no backlog
    file at all.
 4. **Only on the other account: kept.** An item the signed-in account never had stays.
@@ -254,17 +260,23 @@ How it decides. The rules are in `desktop_handover.py`.
 - **The end of the transcript.** A finished turn ends with a reply whose `stop_reason` is
   `end_turn`. A transcript that ends with a tool call, a tool result or a prompt has no
   such reply: the turn was cut off. A last message that is an error (a usage limit, a
-  lapsed login) is a turn that failed. A turn you stopped yourself is neither.
+  lapsed login) is a turn that failed. A turn you stopped yourself is neither. A message
+  from another chat and a skill's text count as prompts. The filler reply the CLI writes
+  before such a message ("No response requested.") is not a reply, so a chat that was
+  restarted and died before its first answer is still cut off.
 - **The process list.** While a chat works, its transcript also ends in the middle of a
   turn. The difference is its `claude` process, which names the chat (`--resume=<id>`).
   A brand-new chat's process names none, so it is matched by its start time. A chat
   with a process is working and is not listed. If `ps` cannot be asked, no chat is
-  called cut off.
+  called cut off. After a passing error (the Mac slept, the connection dropped) Claude
+  Code tries again by itself, so a chat with a process is not called stopped until the
+  error is 5 minutes old. A usage limit or a lapsed login is listed at once.
 - **The chat record.** After a turn the app notes on the record whether the chat needs
   something from you. Those chats are listed as waiting.
 
-Only chats with a record in an account folder are looked at, archived ones are left out,
-and the command only reads. `--hours N` changes how far back it looks, and `--json` prints
+Only chats with a record in an account folder are looked at, archived ones are left out
+(when the accounts' copies disagree, the file that changed last decides), and the command
+only reads. `--hours N` changes how far back it looks, and `--json` prints
 the list with each chat's id for a chat that picks the work up. `claude-accounts sync
 status` says how many chats there are, and `desktop_sync.handover_lines(cfg)` gives the
 list as text lines to other code.

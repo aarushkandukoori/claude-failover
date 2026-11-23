@@ -73,6 +73,7 @@ MAX_BACKLOG_BYTES = 32 * 1024 * 1024        # the app reads no bigger backlog fi
 TASK_BACKUP_DAYS = 30
 TASK_BACKUP_KEEP = 5           # newest task-list backups kept per account, whatever their age
 HANDOVER_HOURS = 48            # `sync handover` looks at chats that were active this recently
+RETRY_GRACE_SECONDS = 300      # after a passing error a chat with a process may still be trying again
 RESTART_HOURS = 6              # `sync restart` only restarts chats that were cut off this recently
 RESTART_RECHECK_SECONDS = 5    # it looks twice, this far apart: a chat whose process is just restarting has moved on
 RESTARTS_FILE = "restarts.json"     # which chats were claimed for a restart, and when
@@ -971,6 +972,20 @@ def backlog_count(folder_path):
     return len(read_backlog(folder_path)[0]["items"])
 
 
+def held_keys(folder, raw, items, seen, ours):
+    """The items of an account's backlog that the app itself is known to hold, as
+    keys. A file that is still byte for byte what this tool wrote proves nothing:
+    the app may not have read that write, and may save an older copy of the list
+    over it, or drop items to make room. So until the app has saved the file
+    itself, only what was held before and is still there counts. `seen` is
+    backlog-seen.json, `ours` the hashes of this tool's last writes."""
+    now = desktop_backlog.keys(items)
+    if raw is not None and ours.get(written_key(folder, "backlog")) == hashlib.sha256(raw).hexdigest():
+        before = seen.get(task_key(folder))
+        return sorted(set(before if isinstance(before, list) else []) & set(now))
+    return now
+
+
 def mirror_backlog(cfg, folders, active, sdir, dry_run, errors):
     """Make every other account's task backlog hold what the signed-in account's
     holds, by the rules in desktop_backlog.plan. Returns the "backlog" part of
@@ -999,13 +1014,16 @@ def mirror_backlog(cfg, folders, active, sdir, dry_run, errors):
     state = Path(sdir if sdir is not None else sync_dir()) / BACKLOG_SEEN_FILE
     seen = cf.read_json(state, {})
     seen = seen if isinstance(seen, dict) else {}
+    ours = cf.read_json(state.parent / TASKS_WRITTEN_FILE, {})
+    ours = ours if isinstance(ours, dict) else {}
     before = seen.get(task_key(src))
     before = before if isinstance(before, list) else None
     now_ms = time.time() * 1000
     after, settled = {}, True
     for dst in folders:
         if dst is not src:
-            row, left = _backlog_into(cfg, doc["items"], before, dst, now_ms, sdir, dry_run, errors)
+            row, left = _backlog_into(cfg, doc["items"], before, dst, now_ms, sdir, dry_run, errors,
+                                      seen, ours)
             out["targets"].append(row)
             if left is not None:
                 after[task_key(dst)] = left
@@ -1014,7 +1032,7 @@ def mirror_backlog(cfg, folders, active, sdir, dry_run, errors):
     if settled:
         # Only now forget what this list held before: an item that left it must be
         # taken off every other list first, or it would stay there for good.
-        after[task_key(src)] = desktop_backlog.keys(doc["items"])
+        after[task_key(src)] = held_keys(src, raw, doc["items"], seen, ours)
     if not dry_run and any(seen.get(k) != v for k, v in after.items()):
         try:
             cf.atomic_write_json(state, dict(seen, **after))
@@ -1023,10 +1041,10 @@ def mirror_backlog(cfg, folders, active, sdir, dry_run, errors):
     return out
 
 
-def _backlog_into(cfg, items, before, dst, now_ms, sdir, dry_run, errors):
-    """One other account: (its row of the report, the keys its list holds after
-    this run or None when the list could not be read)."""
-    row = {"account": dst["account"], "added": [], "removed": [], "only_there": 0,
+def _backlog_into(cfg, items, before, dst, now_ms, sdir, dry_run, errors, seen, ours):
+    """One other account: (its row of the report, the keys its list is known to
+    hold after this run (see held_keys), or None when the list could not be read)."""
+    row = {"account": dst["account"], "added": [], "removed": [], "skipped": [], "only_there": 0,
            "written": False, "backup": None, "note": None}
     if tasks_in_another_org(cfg, dst, backlog_count):
         row["note"] = "it has a backlog in more than one organization folder"
@@ -1036,9 +1054,9 @@ def _backlog_into(cfg, items, before, dst, now_ms, sdir, dry_run, errors):
     except (Unsafe, desktop_backlog.NotABacklog, OSError) as e:
         row["note"] = "its backlog cannot be read (%s)" % why(e)
         return row, None
-    new_list, row["added"], row["removed"], row["only_there"] = desktop_backlog.plan(
-        items, doc["items"], before, now_ms)
-    old_keys = desktop_backlog.keys(doc["items"])
+    new_list, row["added"], row["removed"], row["only_there"], row["skipped"] = \
+        desktop_backlog.plan(items, doc["items"], before, now_ms)
+    old_keys = held_keys(dst, raw, doc["items"], seen, ours)
     if not (row["added"] or row["removed"]) or dry_run:
         return row, old_keys
     folder = dst["path"] / BACKLOG_DIR
@@ -1066,14 +1084,16 @@ def _backlog_into(cfg, items, before, dst, now_ms, sdir, dry_run, errors):
         remember_tasks_write(sdir, dst, data, "backlog")
     except (OSError, TypeError, ValueError):
         pass   # the next run then makes one backup more than needed
-    return row, desktop_backlog.keys(new_list)
+    # What was added counts as held there only once the app has saved that list itself.
+    return row, sorted(set(old_keys) & set(desktop_backlog.keys(new_list)))
 
 
 def backlog_lines(r):
     """What `claude-accounts sync` prints about the task backlog: only changes and
     lists that were left alone."""
     b = r.get("backlog") or {}
-    rows = [row for row in b.get("targets", []) if row["added"] or row["removed"] or row["note"]]
+    rows = [row for row in b.get("targets", [])
+            if row["added"] or row["removed"] or row["note"] or row["skipped"]]
     if not b.get("source") or not rows:
         return ["Task backlog - not copied: %s" % b["note"]] if b.get("on") and b.get("note") else []
     dry = r["dry_run"]
@@ -1086,11 +1106,19 @@ def backlog_lines(r):
             parts.append("%d %s" % (len(row["added"]), "added" if done else "to add"))
         if row["removed"]:
             parts.append("%d %s" % (len(row["removed"]), "removed" if done else "to remove"))
+        changed = bool(parts)
+        if row["skipped"]:
+            parts.append("%d not copied (no room)" % len(row["skipped"]))
         if parts:
-            lines.append("  %s: %s%s" % (who, ", ".join(parts), "" if done or dry else " - NOT written"))
+            lines.append("  %s: %s%s" % (who, ", ".join(parts),
+                                         "" if done or dry or not changed else " - NOT written"))
             lines.extend("    add - %s" % one_line(t, 100) for t in row["added"])
             lines.extend("    remove - %s (started or dropped on %s)" % (one_line(t, 100), b["source"])
                          for t in row["removed"])
+            lines.extend("    not copied - %s (its folder or the whole list is full: the app keeps %d "
+                         "items per folder and %d in all)" % (
+                             one_line(t, 100), desktop_backlog.FOLDER_CAP, desktop_backlog.TOTAL_CAP)
+                         for t in row["skipped"])
         if row["note"]:
             lines.append("  %s: left alone - %s" % (who, row["note"]))
         if row["backup"]:
@@ -1124,6 +1152,12 @@ def backlog_status_lines(cfg):
         elif b["items"] or row["only_there"]:
             lines.append("  task backlog - %s matches %s (signed in, %s)%s" % (
                 who, b["source"], plural(b["items"], "item"), extra))
+        if row["skipped"]:
+            lines.append("  task backlog - %s of %s %s not fit on %s (the app keeps %d items per "
+                         "folder and %d in all)" % (
+                             plural(len(row["skipped"]), "item"), b["source"],
+                             "does" if len(row["skipped"]) == 1 else "do", who,
+                             desktop_backlog.FOLDER_CAP, desktop_backlog.TOTAL_CAP))
     return lines
 
 
@@ -1246,7 +1280,7 @@ def handover(cfg, hours=HANDOVER_HOURS):
     paths = transcript_paths(cfg)
     found = []
     for sid, record in newest.items():
-        chat = _handover_chat(sid, record, paths, running, oldest)
+        chat = _handover_chat(sid, record, paths, running, oldest, now)
         if chat is not None:
             claim = claims.get(chat["session"])
             sent = (chat["state"] == "cut_off"
@@ -1264,7 +1298,7 @@ def recent_records(cfg, oldest):
     """{chat id: its freshest record over every account folder} for the chats
     whose record file changed since `oldest` (unix seconds)."""
     folders, _skipped = resolve_folders(cfg, desktop_dir(cfg))
-    newest = {}
+    newest, fresh = {}, {}
     for f in folders:
         names = []
         try:
@@ -1281,15 +1315,18 @@ def recent_records(cfg, oldest):
         for name in names:
             sid = name[len("local_"):-len(".json")]
             try:
-                _raw, record, _st = load_record(f["path"] / name, sid)
+                _raw, record, st = load_record(f["path"] / name, sid)
             except (Unsafe, Invalid, OSError):
                 continue
-            if sid not in newest or activity(record) > activity(newest[sid]):
-                newest[sid] = record
+            # An archive or a rename leaves the activity as it was: then the file
+            # that changed last says how the chat stands now.
+            mine = (activity(record), st.st_mtime)
+            if sid not in newest or newer(mine, fresh[sid]):
+                newest[sid], fresh[sid] = record, mine
     return newest
 
 
-def _handover_chat(sid, record, paths, running, oldest):
+def _handover_chat(sid, record, paths, running, oldest, now):
     """One chat's entry of the hand-over list, or None when the chat was not left
     in the middle of anything."""
     if record.get("isArchived") is True:
@@ -1307,18 +1344,25 @@ def _handover_chat(sid, record, paths, running, oldest):
     except OSError:
         return None
     state, detail, why_failed = None, tail["detail"], None
+    at = cf.parse_iso(tail["at"]) or dt.datetime.fromtimestamp(st.st_mtime, cf.LOCAL_TZ)
+    born = getattr(st, "st_birthtime", None)
+    alive = running is not None and desktop_handover.is_alive(cli_id, born, running)
     if tail["state"] == desktop_handover.CUT_OFF:
-        born = getattr(st, "st_birthtime", None)
-        if running is not None and not desktop_handover.is_alive(cli_id, born, running):
+        if running is not None and not alive:
             state = "cut_off"
     elif tail["state"] == desktop_handover.FAILED:
-        state, why_failed = "failed", cf.classify(1, detail, "").get("kind", "error")
+        why_failed = cf.classify(1, detail, "").get("kind", "error")
+        # After a passing error (the Mac slept, the connection dropped) Claude Code
+        # tries again by itself. While its process is there and the error is fresh,
+        # the chat is working, not stopped. A limit or a lapsed login is the end.
+        retrying = (why_failed == "error" and alive
+                    and now - at.timestamp() < RETRY_GRACE_SECONDS)
+        state = None if retrying else "failed"
     elif tail["state"] == desktop_handover.DONE:
         detail = desktop_handover.waiting_on_person(record)
         state = "waiting" if detail else None
     if state is None:
         return None
-    at = cf.parse_iso(tail["at"]) or dt.datetime.fromtimestamp(st.st_mtime, cf.LOCAL_TZ)
     title = record.get("title")
     task = record.get("scheduledTaskId")
     return {"session": "local_" + sid, "cli_session": cli_id,
