@@ -225,10 +225,16 @@ The rules. All of them are in `desktop_backlog.py`.
    it is removed from the other account's list too. Otherwise it would come back after a
    switch and invite doing the work twice. Two things that look the same are not that:
    - **An item the app never took over.** What sync wrote into a list counts as held
-     there only with proof that the app read that write: the app's own save kept another
-     item of the same or a later write, or a later sync still found the write untouched
-     two minutes after it was made. Without that proof the app may have saved an older
-     copy of the list over the write, and the item stays on the account it came from.
+     there in two cases: the app's own save kept another item of the same or a later
+     write, or the app was still signed in to another account after the write was made.
+     The app reads an account's list when it signs in to it, so its next sign-in there
+     finds the write. A look at the signed-in account's own list settles nothing, however
+     long the file sits there untouched: the app may have opened the list a moment before
+     the write. In every other case the app may have saved an older copy of the list over
+     the write, and the item stays on the account it came from. This is a rule of thumb
+     about an app that documents none of this, not proof. It errs on the side of keeping:
+     an item kept by mistake comes back once after a switch, while an item removed by
+     mistake would be gone from both accounts (a copy stays in the backups).
    - **An item pushed out of a full folder.** While a folder holds 20 items, or the list
      100, the app drops the oldest by itself. An item that left such a folder is not
      taken off the other list.
@@ -302,8 +308,14 @@ claude-accounts sync auto-restart on     # and: off, or no argument to see where
 ```
 
 With it on, the chats that a sign-out cut off start again by themselves once the app is
-signed in to the other account. Nothing outside the app can type into a chat, so the
-restart comes from inside it, through the app's own scheduled tasks:
+signed in to the other account: the newest 3, and only when that account has a current
+usage reading with usage left. The readings come from `account_switch.py`
+(`claude-accounts usage`; its watcher, `claude-accounts watch install`, keeps them
+current, see [SWITCHING.md](SWITCHING.md)). Without a reading nothing is armed and
+nothing is restarted, and `claude-accounts sync auto-restart` says so.
+
+Nothing outside the app can type into a chat, so the restart comes from inside it,
+through the app's own scheduled tasks:
 
 1. **A pick-up task waits in the other account's task list.** Every sync makes sure the
    task list of each account the app is not signed in to holds a one-time task named
@@ -336,7 +348,8 @@ What `sync restart` hands out, and what it never does:
   the sign-out.
 - **Nothing when auto-restart is off.** A pick-up task that starts anyway (it was still
   armed, or someone pressed Run now) gets an empty list. `sync restart --by-hand` is for a
-  person or a chat that wants the list regardless.
+  person or a chat that wants the list while auto-restart is off. It is not a way around
+  the next two checks: it still needs the gate's yes and a usage reading.
 - **Nothing when the gate says no.** `"desktop_sync": {"restart_gate": "<command>"}` names
   a command that is run before any chat is handed out. Any exit code but 0 means not now,
   for example a check that enough memory is free.
@@ -349,19 +362,22 @@ What `sync restart` hands out, and what it never does:
 - **Only on an account that is known to have usage left.** Not knowing counts as no: a
   chat restarted on an account that is out of usage stops again at once, or runs up a bill
   when paid extra usage is turned on. Sync reads no usage itself. The readings come from
-  an optional module named `account_switch`. Its picture of an account has to say that
+  `account_switch.py`. Its picture of an account has to say that
   the account is not out, that its fullest window (the 5-hour one or the week) has room,
   and that it is not running on extra usage. With extra usage turned on, the reading must
-  also be at most 90 minutes old at the moment chats are restarted. Without that module,
-  without a current reading, or when the app's account cannot be named, the pick-up task
-  is not armed and `sync restart` hands out nothing. `sync auto-restart` says which it is.
+  also be at most 90 minutes old at the moment chats are restarted (for arming the task,
+  the age of a reading is left to that module). Where the module is missing or fails,
+  without a current reading, with a reading in a shape sync does not know, or when the
+  app's account cannot be named, the pick-up task is not armed and `sync restart` hands
+  out nothing. `sync auto-restart` says which it is.
 
 What to know before turning it on:
 
 - The pick-up task runs in the permission mode that task has in the app, or your default
   mode when it has none. Sync never writes a mode into it. It copies the mode and the
-  approvals that the app stored for this task on the signed-in account, as it does for
-  every task, also into a copy that is armed already. In a mode that asks before a step,
+  approvals that the app stored for this task on the signed-in account, also into a copy
+  that is armed already, and takes away again what was cleared there. In a mode that asks
+  before a step,
   the run stops and waits for you, so for a restart with nobody there, open the task in
   the app once and give it a mode that does not ask.
 - Its instructions can be edited; sync writes the file only when it is missing.
@@ -370,8 +386,12 @@ What to know before turning it on:
 - It rests on how the app stores and starts scheduled tasks, which is not a documented
   interface. If the task does not start, nothing is lost: `claude-accounts sync handover`
   still lists the chats.
-- Turning it off (`claude-accounts sync auto-restart off`) switches the waiting task off
-  at once. It is never deleted by sync; delete it in the app if you want it gone.
+- Turning it on or off arms the waiting task, or switches it off, right away. That
+  command is a switch and nothing else: it copies no chats, no other tasks and no
+  backlogs, also when the background sync is not installed. When it cannot get at a task
+  list at that moment (another sync is running, or the app's account cannot be told), it
+  says so and a later sync does it; a task that starts in between restarts nothing. The
+  task is never deleted by sync; delete it in the app if you want it gone.
 
 ## A sync at sign-out
 
@@ -464,7 +484,7 @@ transcript, which `claude --resume` lists.
   backups are next to the task-list backups, named `backlog.<date>-<time>.json`, and go
   back the same way, over `backlog/tasks.json` in the account's folder.
 - **Stop the automatic restarts** - `claude-accounts sync auto-restart off`. The waiting
-  pick-up task is switched off at once.
+  pick-up task is switched off right away, and the command says so when it could not.
 - **Stop the sync at sign-out** - it is part of the background job. `claude-accounts sync
   uninstall` removes the job, and with it the sync on its interval.
 - **Put a task list back** - every list sync replaced has copies in

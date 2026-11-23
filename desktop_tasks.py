@@ -38,6 +38,9 @@ RUN_FIELDS = ("lastRunAt", "lastScheduledFor")   # what the app writes when a ta
 PICKUP_KEEP = ("id", "displayName", "filePath", "createdAt", "cwd", "model", "permissionMode",
                "permissionModeCarried", "approvedPermissions", "madeByClaude", "promptWrittenBy",
                "promptFileHash")
+# What the person gives the task in the app. Of these the copy holds exactly what
+# the signed-in account's entry holds, also when that is less than before.
+PICKUP_GIVEN = ("permissionMode", "permissionModeCarried", "approvedPermissions")
 
 
 class NotATaskList(Exception):
@@ -231,6 +234,17 @@ def is_armed(task, now_ms):
     return is_one_time(task) and is_live(task) and task["fireAt"] <= now_ms
 
 
+def _only_what_is_given(entry, mine):
+    """Take from a copy of the pick-up task the permission mode and the approvals
+    that the signed-in account's entry no longer has: what the person took away
+    in the app must not stay on a copy that runs unattended. Nothing is known,
+    and nothing is taken, when that account has no entry for the task."""
+    if mine is not None:
+        for key in PICKUP_GIVEN:
+            if key not in mine:
+                entry.pop(key, None)
+
+
 def pickup_plan(mine, theirs, base, want_armed, now_ms):
     """What the other account's copy of the pick-up task should be. That task
     restarts the chats a sign-out cut off, and it has to start by itself when
@@ -256,10 +270,12 @@ def pickup_plan(mine, theirs, base, want_armed, now_ms):
         fresh = copy.deepcopy(theirs)
         fresh.update({k: copy.deepcopy(v) for k, v in (mine or {}).items()
                       if k in PICKUP_KEEP and k not in ("id", "createdAt")})
+        _only_what_is_given(fresh, mine)
         return fresh, (None if same(fresh, theirs) else "update")
     merged = dict(base)
     for older in (theirs, mine):   # the signed-in account's settings count most
         merged.update({k: copy.deepcopy(v) for k, v in (older or {}).items() if k in PICKUP_KEEP})
+    _only_what_is_given(merged, mine)
     entry = {k: merged[k] for k in PICKUP_KEEP if k in merged}
     made = entry.get("createdAt")
     if isinstance(made, bool) or not isinstance(made, (int, float)):

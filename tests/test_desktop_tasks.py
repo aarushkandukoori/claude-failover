@@ -376,6 +376,30 @@ class PickupTest(unittest.TestCase):
             for field in ("permissionMode", "permissionModeCarried", "approvedPermissions"):
                 self.assertNotIn(field, entry)
 
+    def test_what_the_person_took_away_in_the_app_leaves_the_copy_too(self):
+        approvals = [{"toolName": "Bash", "ruleContent": "claude-accounts sync restart:*"}]
+        armed = dict(self.BASE, createdAt=NOW, fireAt=NOW - 1000, enabled=True, model="opus",
+                     permissionMode="bypassPermissions", permissionModeCarried=True,
+                     approvedPermissions=approvals)
+        # The signed-in account's entry has no mode and no approvals any more: the person
+        # cleared them in the app. A copy that runs unattended must not keep them.
+        mine = dict(self.BASE, enabled=True, createdAt=7, model="opus")
+        fresh, action = self.plan(mine, armed)
+        self.assertEqual((action, fresh), ("update", dict(self.BASE, createdAt=NOW, fireAt=NOW - 1000,
+                                                          enabled=True, model="opus")))
+        self.assertEqual(self.plan(mine, fresh), (fresh, None))
+        # The same when the copy is armed anew after it ran.
+        entry, action = self.plan(mine, ran(armed))
+        self.assertEqual(action, "arm")
+        for field in dt.PICKUP_GIVEN:
+            self.assertNotIn(field, entry)
+        # A mode that is still there stays, and one field can go while another stays.
+        entry, _action = self.plan(dict(mine, permissionMode="auto"), armed)
+        self.assertEqual((entry["permissionMode"], "approvedPermissions" in entry), ("auto", False))
+        # With no entry on the signed-in account nothing is known: the copy keeps what it has.
+        self.assertEqual(self.plan(None, armed), (armed, None))
+        self.assertEqual(self.plan(None, ran(armed))[0]["permissionMode"], "bypassPermissions")
+
     def test_not_wanted_means_switched_off_never_deleted(self):
         armed = dict(self.BASE, createdAt=NOW, fireAt=NOW - 1000, enabled=True)
         entry, action = self.plan(None, armed, want=False)

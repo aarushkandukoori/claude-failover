@@ -84,6 +84,7 @@ OUT_OF_USAGE_AT = 0.97         # usage this far gone counts as used up
 RESTART_MAX = 3                # chats one `sync restart` hands out at most
 USAGE_EXTRA_MAX_MINUTES = 90   # with paid extra usage on, a usage reading older than this decides nothing
 GATE_SECONDS = 60              # how long the restart gate command may take
+PICKUP_LOCK_SECONDS = 10       # how long `sync auto-restart on|off` waits for a sync that is running
 TAIL_BYTES = 512 * 1024        # how much of a transcript's end is read first
 TAIL_MAX_BYTES = 32 * 1024 * 1024
 PS_RE = re.compile(r"^\s*(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)\s+(.*)$")   # [[days-]hours:]minutes:seconds command
@@ -128,8 +129,11 @@ USAGE = """usage: claude-accounts sync [--dry-run] [--quiet] [--json]
   sync handover     the chats that were left in the middle of their work (cut
                     off by a sign-out, stopped by a usage limit) or wait for you
   sync restart      claim the chats a sign-out cut off, each one once, and print
-                    the message to send each of them (the pick-up task runs this)
-  sync auto-restart have the app restart those chats by itself after a switch"""
+                    the message to send each of them (the pick-up task runs this;
+                    --by-hand hands them out while auto-restart is off)
+  sync auto-restart have the app restart those chats by itself after a switch:
+                    the newest 3, and only on an account with a current usage
+                    reading (claude-accounts usage)"""
 
 
 class Unsafe(Exception):
@@ -744,13 +748,17 @@ TWO_ORGS = ("it has tasks in more than one organization folder (name the one to 
             "desktop_org_uuid in the config)")
 
 
-def mirror_tasks(cfg, folders, active, sdir, dry_run, errors):
+def mirror_tasks(cfg, folders, active, sdir, dry_run, errors, only_pickup=False):
     """Make every other account's scheduled-tasks.json say what the signed-in
     account's says, by the rules in desktop_tasks.plan. Returns the
     "scheduled_tasks" part of the report. The signed-in account's file is only
-    read: the app holds it in memory and rewrites it. A dry run writes nothing."""
+    read: the app holds it in memory and rewrites it. A dry run writes nothing.
+
+    `only_pickup` arms or disarms the pick-up task and leaves every other task
+    as it is (see pickup_step). Switching that task off does not need the task
+    copying to be on."""
     out = {"on": tasks_on(cfg), "source": None, "tasks": 0, "note": None, "targets": []}
-    if not out["on"]:
+    if not out["on"] and not (only_pickup and not auto_restart_on(cfg)):
         out["note"] = "turned off in the config (desktop_sync.scheduled_tasks)"
         return out
     if len(folders) < 2:
@@ -776,13 +784,15 @@ def mirror_tasks(cfg, folders, active, sdir, dry_run, errors):
     for dst in folders:
         if dst is not src:
             out["targets"].append(
-                _mirror_into(cfg, doc["scheduledTasks"], dst, now_ms, sdir, dry_run, errors))
+                _mirror_into(cfg, doc["scheduledTasks"], dst, now_ms, sdir, dry_run, errors,
+                             only_pickup))
     return out
 
 
-def _mirror_into(cfg, tasks, dst, now_ms, sdir, dry_run, errors):
+def _mirror_into(cfg, tasks, dst, now_ms, sdir, dry_run, errors, only_pickup=False):
     """One other account: plan the changes and, unless it is a dry run, save a
-    copy of its list and write the new one."""
+    copy of its list and write the new one. With `only_pickup` its other tasks
+    stay exactly as they are."""
     row = {"account": dst["account"], "changes": [], "only_there": [], "written": False,
            "backup": None, "note": None}
     if tasks_in_another_org(cfg, dst):
@@ -794,9 +804,12 @@ def _mirror_into(cfg, tasks, dst, now_ms, sdir, dry_run, errors):
         row["note"] = "its task list cannot be read (%s)" % why(e)
         return row
     theirs = doc["scheduledTasks"]
-    new_list, row["changes"], row["only_there"] = desktop_tasks.plan(
-        [t for t in tasks if t["id"] != PICKUP_ID], [t for t in theirs if t["id"] != PICKUP_ID],
-        now_ms)
+    if only_pickup:
+        new_list = [t for t in theirs if t["id"] != PICKUP_ID]
+    else:
+        new_list, row["changes"], row["only_there"] = desktop_tasks.plan(
+            [t for t in tasks if t["id"] != PICKUP_ID],
+            [t for t in theirs if t["id"] != PICKUP_ID], now_ms)
     # The pick-up task is the one task that is not copied as it is: see pickup_plan.
     mine_pick = next((t for t in tasks if t["id"] == PICKUP_ID), None)
     their_pick = next((t for t in theirs if t["id"] == PICKUP_ID), None)
@@ -1015,15 +1028,29 @@ def mirror_backlog(cfg, folders, active, sdir, dry_run, errors):
     ours = cf.read_json(state.parent / TASKS_WRITTEN_FILE, {})
     ours = ours if isinstance(ours, dict) else {}
     now = time.time()
-    # What left the signed-in account's list since it was last looked at.
+    # What left the signed-in account's list since it was last looked at. The app
+    # holds this list in memory, so finding the file untouched says nothing about
+    # what the app has read (the False).
     src_memory, gone = desktop_backlog.resolve(
         desktop_backlog.memory(seen.get(task_key(src))), desktop_backlog.keys(doc["items"]),
-        still_ours(src, raw, ours), now)
+        still_ours(src, raw, ours), False)
+    ddir = desktop_dir(cfg)
+
+    def app_still_here():
+        """Asked right after a write into another account's list: is the app still
+        signed in to the account this run copies from? It names the account it
+        signs in to before it reads that account's lists, so a yes means it has
+        not opened the list that was just written."""
+        try:
+            return same_id(active_account_uuid(ddir), src["account_uuid"])
+        except Exception:
+            return False
+
     after, settled = {}, True
     for dst in folders:
         if dst is not src:
             row, left = _backlog_into(cfg, doc["items"], gone, dst, now, sdir, dry_run, errors,
-                                      seen, ours)
+                                      seen, ours, app_still_here)
             out["targets"].append(row)
             if left is not None:
                 after[task_key(dst)] = left
@@ -1041,10 +1068,12 @@ def mirror_backlog(cfg, folders, active, sdir, dry_run, errors):
     return out
 
 
-def _backlog_into(cfg, items, gone, dst, now, sdir, dry_run, errors, seen, ours):
+def _backlog_into(cfg, items, gone, dst, now, sdir, dry_run, errors, seen, ours, app_still_here):
     """One other account: (its row of the report, what is remembered about its
     list from here on (desktop_backlog.memory), or None when the list could not
-    be read). `gone` = the keys that left the signed-in account's list."""
+    be read). `gone` = the keys that left the signed-in account's list.
+    `app_still_here()` = the app is still signed in to the account being copied
+    from: asked after a write, see desktop_backlog.resolve."""
     row = {"account": dst["account"], "added": [], "removed": [], "skipped": [], "only_there": 0,
            "written": False, "backup": None, "note": None}
     if tasks_in_another_org(cfg, dst, backlog_count):
@@ -1058,10 +1087,12 @@ def _backlog_into(cfg, items, gone, dst, now, sdir, dry_run, errors, seen, ours)
     new_list, row["added"], row["removed"], row["only_there"], row["skipped"] = \
         desktop_backlog.plan(items, doc["items"], gone, now * 1000)
     # Its own memory: if the app saved this list while it was signed in there, what
-    # it holds is known again. What left it meanwhile is not followed up here.
+    # it holds is known again. What left it meanwhile is not followed up here. If
+    # the file is still what this tool wrote, the app, signed in elsewhere when this
+    # run began, reads those items at its next sign-in there (the True).
     old_keys = desktop_backlog.keys(doc["items"])
     remembered, _left = desktop_backlog.resolve(
-        desktop_backlog.memory(seen.get(task_key(dst))), old_keys, still_ours(dst, raw, ours), now)
+        desktop_backlog.memory(seen.get(task_key(dst))), old_keys, still_ours(dst, raw, ours), True)
     if not (row["added"] or row["removed"]) or dry_run:
         return row, remembered
     folder = dst["path"] / BACKLOG_DIR
@@ -1089,9 +1120,12 @@ def _backlog_into(cfg, items, gone, dst, now, sdir, dry_run, errors, seen, ours)
         remember_tasks_write(sdir, dst, data, "backlog")
     except (OSError, TypeError, ValueError):
         pass   # the next run then makes one backup more than needed
-    # What was added is pending there until the app is seen to have taken it over.
+    # What was added is pending there until the app is seen to have taken it over. A
+    # sign-in to that account while this run was under way may have read the list
+    # just before the write: only an app that is still here afterwards confirms it.
     new_keys = desktop_backlog.keys(new_list)
-    return row, desktop_backlog.after_write(remembered, new_keys, set(new_keys) - set(old_keys), now)
+    return row, desktop_backlog.after_write(remembered, new_keys, set(new_keys) - set(old_keys), now,
+                                            app_still_here())
 
 
 def backlog_lines(r):
@@ -1531,19 +1565,34 @@ def usage_verdict(cfg, account, strict=True):
     Not knowing counts as no: a chat restarted on an account that is out of usage
     stops again at once, or, with paid extra usage turned on, runs up a bill.
 
-    This tool reads no usage itself. The readings come from an optional module
-    named account_switch (a switch helper that is not part of this repository):
-    its snapshot() says per account whether it is out, how much room its fullest
-    window has left, and whether paid extra usage is on. Without that module
-    nothing counts as known. `strict` (for the moment chats are restarted) also
-    wants a recent reading when extra usage is on."""
+    This tool reads no usage itself. The readings come from account_switch.py
+    (`claude-accounts usage`; its watcher keeps them current): snapshot() says
+    per account whether it is out, how much room its fullest window has left,
+    and whether paid extra usage is on. Where that module is missing or fails,
+    or a reading is not in the shape this tool knows, nothing counts as known.
+    `strict` (for the moment chats are restarted) also wants a recent reading
+    when extra usage is on."""
     if not account:
         return False, "cannot tell which account the app is signed in to"
     try:
         import account_switch
         acct = account_switch.snapshot(cfg, extension={})["accounts"].get(account)
     except Exception:   # no such module, or it failed: nothing is known
-        return False, "there are no usage readings (they come from a switch helper)"
+        return False, "there are no usage readings (account_switch.py is missing or failed)"
+    try:
+        return _usage_verdict(account, acct, strict)
+    except Exception:   # a reading in a shape this tool does not know: nothing is known
+        return False, "the usage reading for %s could not be read" % account
+
+
+def _finite(value):
+    """True for a real number: not a bool, not NaN, not infinite."""
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value))
+
+
+def _usage_verdict(account, acct, strict):
+    """usage_verdict for one account's reading, as account_switch.snapshot() gave it."""
     if not isinstance(acct, dict):
         return False, "there is no usage reading for %s" % account
     if acct.get("out") or acct.get("spent"):
@@ -1551,15 +1600,18 @@ def usage_verdict(cfg, account, strict=True):
                      if isinstance(acct.get(k), dt.datetime)), None)
         return False, "%s is out of usage%s" % (
             account, " until %s" % clock(cf.iso(back)) if back else "")
-    room, read_at = acct.get("room"), acct.get("read_at")
-    known = isinstance(room, (int, float)) and not isinstance(room, bool)
-    if not known or not isinstance(read_at, dt.datetime):
+    room, week, read_at = acct.get("room"), acct.get("week_room"), acct.get("read_at")
+    # Room is a share of a window: a number up to 1. Anything else is no reading.
+    known = (_finite(room) and room <= 1 and (week is None or (_finite(week) and week <= 1))
+             and isinstance(read_at, dt.datetime))
+    if not known:
         return False, "there is no current usage reading for %s" % account
     if acct.get("extra_in_use"):
         return False, "%s is running on paid extra usage" % account
-    week = acct.get("week_room")
-    if room <= 1 - OUT_OF_USAGE_AT or (isinstance(week, (int, float)) and week <= 1 - OUT_OF_USAGE_AT):
+    if room <= 1 - OUT_OF_USAGE_AT or (week is not None and week <= 1 - OUT_OF_USAGE_AT):
         return False, "%s has almost no usage left" % account
+    if read_at.tzinfo is None:
+        read_at = read_at.replace(tzinfo=cf.LOCAL_TZ)   # a time without a zone is local time
     age = (cf.now_local() - read_at).total_seconds() / 60.0
     if strict and acct.get("extra") and not 0 <= age <= USAGE_EXTRA_MAX_MINUTES:
         return False, ("the last usage reading for %s is %d minutes old, and it has paid extra "
@@ -1775,8 +1827,16 @@ def restart_status_lines(cfg):
     other account's task list? It only reads. Never raises."""
     try:
         if not auto_restart_on(cfg):
-            return ['  auto-restart - off: a chat cut off by a switch waits for a "continue" '
-                    "(claude-accounts sync auto-restart on)"]
+            lines = ['  auto-restart - off: a chat cut off by a switch waits for a "continue" '
+                     "(claude-accounts sync auto-restart on)"]
+            waiting = armed_pickups(cfg)
+            if waiting:
+                lines.append("  auto-restart - a pick-up task still waits on %s: a sync switches it "
+                             "off, and if it starts first it restarts nothing" % ", ".join(waiting))
+            return lines
+        if not tasks_on(cfg):
+            return ["  auto-restart - on, but nothing is armed while copying scheduled tasks is "
+                    "turned off in the config (desktop_sync.scheduled_tasks)"]
         ddir = desktop_dir(cfg)
         folders, _skipped = resolve_folders(cfg, ddir)
         active = active_account_uuid(ddir)
@@ -1802,41 +1862,130 @@ def restart_status_lines(cfg):
         return []
 
 
+def armed_pickups(cfg):
+    """The accounts in whose task list a pick-up task waits armed right now: it
+    would start at the next sign-in there. It only reads. Never raises."""
+    try:
+        folders, _skipped = resolve_folders(cfg, desktop_dir(cfg))
+        now_ms, found = time.time() * 1000, []
+        for f in folders:
+            try:
+                tasks = read_tasks(f["path"] / TASKS_FILE)[0]["scheduledTasks"]
+            except (Unsafe, desktop_tasks.NotATaskList, OSError):
+                continue
+            if any(t["id"] == PICKUP_ID and desktop_tasks.is_armed(t, now_ms) for t in tasks):
+                found.append(f["account"])
+        return found
+    except Exception:
+        return []
+
+
+def pickup_step(cfg):
+    """Arm or disarm the pick-up task in the other accounts' task lists now, and
+    touch nothing else: no chat, no other task and no backlog is copied. Returns
+    the "scheduled_tasks" part of a report (see mirror_tasks) plus "errors". Its
+    "note" says why nothing was looked at. Never raises."""
+    errors = []
+    out = {"on": tasks_on(cfg), "source": None, "tasks": 0, "note": None, "targets": [],
+           "errors": errors}
+    sdir = sync_dir()
+    try:
+        private_dir(sdir)
+        lock = open(str(sdir / ".lock"), "a+")
+    except OSError as e:
+        out["note"] = "cannot use the state folder %s (%s)" % (tilde(sdir), why(e))
+        return out
+    with lock:
+        waited = 0.0
+        while True:   # a sync takes a second or two: wait for it instead of giving up
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if waited >= PICKUP_LOCK_SECONDS:
+                    out["note"] = "another sync is running"
+                    return out
+                time.sleep(0.2)
+                waited += 0.2
+        try:
+            ddir = desktop_dir(cfg)
+            folders, _skipped = resolve_folders(cfg, ddir)
+            out.update(mirror_tasks(cfg, folders, active_account_uuid(ddir), sdir, False, errors,
+                                    only_pickup=True))
+        except Exception as e:   # like the sync: say it, never raise
+            out["note"] = why(e)
+        return out
+
+
+def setting_on_disk(cfg, key):
+    """One "desktop_sync" setting as the config file on disk has it, None when it
+    is not there or the file cannot be read."""
+    try:
+        with open(os.path.realpath(config_file(cfg)), "r", encoding="utf-8") as f:
+            block = json.load(f).get("desktop_sync")
+        return block.get(key) if isinstance(block, dict) else None
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
 def cmd_auto_restart(cfg, args):
     if args not in ([], ["on"], ["off"]):
         print(USAGE)
         return 2
-    if args:
-        on = args == ["on"]
-        print(set_setting(cfg, "auto_restart", on))
-        # Act on it now, not at the next background sync: a pick-up task that is
-        # still armed after "off" would start at the next sign-in.
-        block = cfg.get("desktop_sync") if isinstance(cfg.get("desktop_sync"), dict) else {}
-        cfg["desktop_sync"] = dict(block, auto_restart=on)
-        report = sync(cfg)
-        for line in task_lines(report) if "folders" in report else []:
-            if PICKUP_NAME in line:
-                print(line.strip())
-        for e in report.get("errors") or []:
-            print("error - %s" % e)
-        if on:
-            try:
-                print("The pick-up task's instructions: %s" % tilde(ensure_pickup_prompt(cfg)))
-            except OSError as e:
-                print("Could not write the pick-up task's instructions: %s" % why(e))
-                return 1
-            print("A task named \"%s\" waits in the task list of every account the app is not "
-                  "signed in to and that is known to have usage left. It starts when the app signs "
-                  "in there and restarts the newest %s the sign-out cut off. It runs in the "
-                  "permission mode that task has in the app (or your default mode): in a mode that "
-                  "asks before a step, the run waits for you." % (
-                      PICKUP_NAME, plural(restart_max(cfg), "chat")))
-        else:
-            print("A waiting pick-up task is switched off, and one that starts anyway restarts "
-                  "nothing. Chats cut off by a switch wait until someone tells them to continue "
-                  "(claude-accounts sync handover).")
+    if not args:
+        print("\n".join(["Restarting chats after a switch"] + restart_status_lines(cfg)))
         return 0
-    print("\n".join(["Restarting chats after a switch"] + restart_status_lines(cfg)))
+    on = args == ["on"]
+    print(set_setting(cfg, "auto_restart", on))
+    if setting_on_disk(cfg, "auto_restart") is not on:
+        # The line above says what to add by hand. Arming or disarming now would not
+        # last: the next sync goes by the file.
+        print("The setting is not saved, so nothing else was changed.")
+        return 1
+    block = cfg.get("desktop_sync") if isinstance(cfg.get("desktop_sync"), dict) else {}
+    cfg["desktop_sync"] = dict(block, auto_restart=on)
+    # Act on it now, not at the next background sync: a pick-up task that is still
+    # armed after "off" would start at the next sign-in. Only that task is touched.
+    # This command is a switch: it copies no chats, no other tasks and no backlogs.
+    step = pickup_step(cfg)
+    why_not = step["note"]
+    for row in step["targets"]:
+        for c in row["changes"]:
+            if c["id"] != PICKUP_ID:
+                continue
+            if row["written"]:
+                print(_change_text(c))
+            else:
+                why_not = why_not or row["note"] or "the task list of %s could not be written" % (
+                    row["account"])
+    for e in step["errors"]:
+        print("error - %s" % e)
+    if on:
+        try:
+            print("The pick-up task's instructions: %s" % tilde(ensure_pickup_prompt(cfg)))
+        except OSError as e:
+            print("Could not write the pick-up task's instructions: %s" % why(e))
+            return 1
+        if why_not:
+            print("Nothing was armed just now: %s." % why_not)
+        print("\n".join(restart_status_lines(cfg)))   # what waits where now, and what does not and why
+        print("A task named \"%s\" waits in the task list of every account the app is not "
+              "signed in to and that has a current usage reading with usage left. The readings "
+              "come from `claude-accounts usage` (its watcher keeps them current: claude-accounts "
+              "watch install); without one for an account, nothing is armed there. The task starts "
+              "when the app signs in there and restarts the newest %s the sign-out cut off. It "
+              "runs in the permission mode that task has in the app (or your default mode): in a "
+              "mode that asks before a step, the run waits for you." % (
+                  PICKUP_NAME, plural(restart_max(cfg), "chat")))
+        return 0
+    waiting = armed_pickups(cfg)
+    if waiting:
+        print("The pick-up task on %s is still switched on (%s). A sync switches it off. If it "
+              "starts before that, it restarts nothing." % (
+                  ", ".join(waiting), why_not or "its task list was not changed"))
+    else:
+        print("No pick-up task is waiting now. Chats cut off by a switch wait until someone tells "
+              "them to continue (claude-accounts sync handover).")
     return 0
 
 

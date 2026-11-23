@@ -20,9 +20,10 @@ The rules, all in plan():
 - An item that left the signed-in account's list was started or dropped there,
   so it is removed from the other account's list too. Otherwise it would come
   back after a switch and invite doing the work twice. Two cases are not that:
-  an item the app never took over from this tool's write (resolve() tells), and
-  an item that left a folder which is full, where the app drops the oldest
-  items by itself to make room. Those stay where they are.
+  an item the app never took over from this tool's write (resolve() judges
+  that from what it can see: a rule of thumb, not proof), and an item that left
+  a folder which is full, where the app drops the oldest items by itself to
+  make room. Those stay where they are.
 - An item only the other account has, and the signed-in account never had,
   stays where it is.
 - Items older than 30 days are not copied: the app drops those itself.
@@ -42,8 +43,6 @@ FOLDER_CAP = 20                      # the app keeps this many items per folder,
 TOTAL_CAP = 100                      # and this many in all: at a save it drops the oldest beyond that
 FOLDER_ROOM = FOLDER_CAP - 3         # how far this tool fills a folder and the whole list: the
 TOTAL_ROOM = TOTAL_CAP - 10          # rest stays free for the items the app files there itself
-SETTLE_SECONDS = 120                 # a write that a later look still found untouched this long after
-                                     # it was made is one the app reads whenever it opens that list
 NEWEST_VERSION = 1                   # the file format this module knows
 
 
@@ -137,59 +136,77 @@ def label(item):
 def memory(entry):
     """What is remembered about one account's list, from its entry in
     backlog-seen.json:
-      held          the items the app itself is known to hold there (keys)
-      pending       {key: when} for the items this tool wrote into the list that
-                    the app has not been seen to take over yet
-      ours_seen_at  when the file was last found exactly as this tool wrote it
-    An older version kept just the list of keys."""
+      held       the items the app itself is known to hold there (keys)
+      pending    {key: when} for the items this tool wrote into the list that
+                 the app has not been seen to take over yet
+      confirmed  the pending items the app is taken to read when it next opens
+                 the list: after they were written, the app was still signed
+                 in to another account (see resolve)
+    An older version kept just the list of keys. A later one kept a time,
+    ours_seen_at, which is no longer used: it was also set by looks taken while
+    the app was signed in to the list itself, and those tell nothing."""
     if isinstance(entry, list):
         entry = {"held": entry}
     entry = entry if isinstance(entry, dict) else {}
     held = entry.get("held") if isinstance(entry.get("held"), list) else []
     pending = entry.get("pending") if isinstance(entry.get("pending"), dict) else {}
-    seen = entry.get("ours_seen_at")
+    confirmed = entry.get("confirmed") if isinstance(entry.get("confirmed"), list) else []
     number = (int, float)
-    return {"held": sorted({k for k in held if isinstance(k, str)}),
-            "pending": {k: float(t) for k, t in pending.items()
-                        if isinstance(k, str) and isinstance(t, number) and not isinstance(t, bool)},
-            "ours_seen_at": float(seen) if isinstance(seen, number) and not isinstance(seen, bool)
-            else None}
+    pending = {k: float(t) for k, t in pending.items()
+               if isinstance(k, str) and isinstance(t, number) and not isinstance(t, bool)}
+    return {"held": sorted({k for k in held if isinstance(k, str)}), "pending": pending,
+            "confirmed": sorted({k for k in confirmed if isinstance(k, str) and k in pending})}
 
 
-def after_write(mem, new_keys, added, now):
+def after_write(mem, new_keys, added, now, elsewhere):
     """The memory of a list right after this tool wrote it: what it added is
-    pending from `now` (unix seconds) on, until the app is seen to hold it."""
+    pending from `now` (unix seconds) on, until the app is seen to hold it.
+    `elsewhere` = after the write, the app was still signed in to another
+    account: then everything pending is confirmed (see resolve)."""
     there = set(new_keys)
     pending = {k: t for k, t in mem["pending"].items() if k in there}
     for k in added:
         pending.setdefault(k, float(now))
-    return {"held": sorted(set(mem["held"]) & there), "pending": pending, "ours_seen_at": float(now)}
+    confirmed = set(pending) if elsewhere else set(mem["confirmed"]) & set(pending)
+    return {"held": sorted(set(mem["held"]) & there), "pending": pending,
+            "confirmed": sorted(confirmed)}
 
 
-def resolve(mem, now_keys, still_ours, now):
+def resolve(mem, now_keys, still_ours, elsewhere):
     """Look at a list again: (its memory from here on, the keys that left it).
 
-    While the file is still byte for byte this tool's last write (`still_ours`),
-    the app has saved nothing, so nothing can have left.
+    still_ours  the file is still byte for byte this tool's last write: the app
+                has saved nothing since
+    elsewhere   the app is signed in to another account at this look (False for
+                the look at the signed-in account's own list)
+
+    While the file is still ours, nothing can have left. Seen like that while
+    the app is signed in elsewhere, what this tool wrote is confirmed: the app
+    reads an account's list when it signs in to it, so its next sign-in here
+    finds the write. A look at the signed-in account's own list confirms
+    nothing: the app holds that list in memory, and an untouched file does not
+    say whether it read the write or opened the list a moment before it.
 
     Otherwise the app saved the list itself, and what it holds now is known. An
-    item counts as having left only if the list held it before. For an item this
-    tool had written there, that takes proof that the app read that write: the
-    app kept another item of the same or a later write, or a later look found the
-    write untouched at least SETTLE_SECONDS after it was made. Without that proof
-    the app may have saved an older copy of the list over the write, and the item
-    was never started there."""
+    item counts as having left only if the list held it before. An item this
+    tool had written there counts as held when it is confirmed, or when the
+    app's save kept another item of the same or a later write. Otherwise the app
+    may have saved an older copy of the list over the write, and the item was
+    never started there.
+
+    This is a rule of thumb about an app that documents none of it, not proof.
+    It errs on the side of keeping: an item that is wrongly kept comes back once
+    after a switch, an item that is wrongly removed is gone from both accounts."""
     here = set(now_keys)
     if still_ours:
-        return dict(mem, ours_seen_at=float(now)), []
-    pending, seen = mem["pending"], mem["ours_seen_at"]
+        return (dict(mem, confirmed=sorted(mem["pending"])) if elsewhere else mem), []
+    pending = mem["pending"]
     kept = [t for k, t in pending.items() if k in here]
     newest = max(kept) if kept else None
-    read = {k for k, t in pending.items()
-            if (newest is not None and t <= newest)
-            or (seen is not None and seen - t >= SETTLE_SECONDS)}
+    read = {k for k, t in pending.items() if newest is not None and t <= newest}
+    read |= set(mem["confirmed"]) & set(pending)
     gone = sorted((set(mem["held"]) | read) - here)
-    return {"held": sorted(here), "pending": {}, "ours_seen_at": None}, gone
+    return {"held": sorted(here), "pending": {}, "confirmed": []}, gone
 
 
 def plan(source, target, gone, now_ms):

@@ -211,53 +211,82 @@ class MemoryTest(unittest.TestCase):
     T0 = 1000.0
 
     def test_an_old_note_is_read_as_held_items(self):
-        self.assertEqual(db.memory(["b", "a"]), {"held": ["a", "b"], "pending": {}, "ours_seen_at": None})
-        self.assertEqual(db.memory(None), {"held": [], "pending": {}, "ours_seen_at": None})
-        mem = {"held": ["a"], "pending": {"x": 5.0, "bad": "soon"}, "ours_seen_at": 9.0, "extra": 1}
-        self.assertEqual(db.memory(mem), {"held": ["a"], "pending": {"x": 5.0}, "ours_seen_at": 9.0})
+        self.assertEqual(db.memory(["b", "a"]), {"held": ["a", "b"], "pending": {}, "confirmed": []})
+        self.assertEqual(db.memory(None), {"held": [], "pending": {}, "confirmed": []})
+        mem = {"held": ["a"], "pending": {"x": 5.0, "bad": "soon"}, "confirmed": ["x", "left", 7],
+               "extra": 1}
+        self.assertEqual(db.memory(mem), {"held": ["a"], "pending": {"x": 5.0}, "confirmed": ["x"]})
+        # The time an earlier version kept confirms nothing: it was also set by looks
+        # taken while the app was signed in to that very list.
+        old = {"held": ["a"], "pending": {"x": 5.0}, "ours_seen_at": 900.0}
+        self.assertEqual(db.memory(old), {"held": ["a"], "pending": {"x": 5.0}, "confirmed": []})
 
     def test_a_write_makes_its_additions_pending(self):
-        mem = db.after_write(db.memory(["own", "leaves"]), ["own", "x", "y"], ["x", "y"], self.T0)
-        self.assertEqual(mem, {"held": ["own"], "pending": {"x": self.T0, "y": self.T0},
-                               "ours_seen_at": self.T0})
+        mem = db.after_write(db.memory(["own", "leaves"]), ["own", "x", "y"], ["x", "y"], self.T0, False)
+        self.assertEqual(mem, {"held": ["own"], "pending": {"x": self.T0, "y": self.T0}, "confirmed": []})
         # A later write keeps the first write's time for what it had added.
-        mem = db.after_write(mem, ["own", "x", "y", "z"], ["z"], self.T0 + 50)
+        mem = db.after_write(mem, ["own", "x", "y", "z"], ["z"], self.T0 + 50, False)
         self.assertEqual(mem["pending"], {"x": self.T0, "y": self.T0, "z": self.T0 + 50})
 
+    def test_a_write_is_confirmed_when_the_app_was_still_elsewhere_after_it(self):
+        mem = db.after_write(db.memory(["own"]), ["own", "x"], ["x"], self.T0, True)
+        self.assertEqual(mem["confirmed"], ["x"])
+        # The next write lands while the app signs in here: only the earlier one stays confirmed.
+        mem = db.after_write(mem, ["own", "x", "y"], ["y"], self.T0 + 50, False)
+        self.assertEqual((sorted(mem["pending"]), mem["confirmed"]), (["x", "y"], ["x"]))
+        # A confirmed write confirms the earlier ones too: they are all in the file the app will read.
+        mem = db.after_write(mem, ["own", "x", "y", "z"], ["z"], self.T0 + 99, True)
+        self.assertEqual(mem["confirmed"], ["x", "y", "z"])
+        # What a write takes out again is no longer pending or confirmed.
+        mem = db.after_write(mem, ["own", "z"], [], self.T0 + 120, False)
+        self.assertEqual((sorted(mem["pending"]), mem["confirmed"]), (["z"], ["z"]))
+
     def test_while_the_file_is_still_ours_nothing_is_known_to_have_left(self):
-        mem = {"held": ["own"], "pending": {"x": self.T0}, "ours_seen_at": self.T0}
-        new, gone = db.resolve(mem, ["own", "x"], True, self.T0 + 600)
-        self.assertEqual((new, gone), ({"held": ["own"], "pending": {"x": self.T0},
-                                        "ours_seen_at": self.T0 + 600}, []))
+        mem = {"held": ["own"], "pending": {"x": self.T0}, "confirmed": []}
+        # Seen while the app is signed in to another account: its next sign-in here reads x.
+        self.assertEqual(db.resolve(mem, ["own", "x"], True, True),
+                         ({"held": ["own"], "pending": {"x": self.T0}, "confirmed": ["x"]}, []))
+        # Seen while the app is signed in to this very list: that tells nothing.
+        self.assertEqual(db.resolve(mem, ["own", "x"], True, False), (mem, []))
 
     def test_the_apps_save_settles_what_it_holds(self):
-        mem = {"held": ["own", "old"], "pending": {"x": self.T0, "y": self.T0}, "ours_seen_at": self.T0}
+        mem = {"held": ["own", "old"], "pending": {"x": self.T0, "y": self.T0}, "confirmed": []}
         # It kept x: so it had read the write, and y, which is missing, was started there.
-        new, gone = db.resolve(mem, ["own", "x", "fresh"], False, self.T0 + 5)
-        self.assertEqual(new, {"held": ["fresh", "own", "x"], "pending": {}, "ours_seen_at": None})
+        new, gone = db.resolve(mem, ["own", "x", "fresh"], False, False)
+        self.assertEqual(new, {"held": ["fresh", "own", "x"], "pending": {}, "confirmed": []})
         self.assertEqual(gone, ["old", "y"])
 
-    def test_a_save_without_any_of_a_fresh_write_proves_nothing(self):
-        # None of what was just written is there: the app may have saved an older copy
-        # of the list over it. Those items were not started. Only its own item left.
-        mem = {"held": ["own", "old"], "pending": {"x": self.T0, "y": self.T0}, "ours_seen_at": self.T0}
-        new, gone = db.resolve(mem, ["own"], False, self.T0 + 5)
+    def test_a_save_without_any_of_an_unconfirmed_write_tells_nothing(self):
+        # None of what was written is there, and nothing says the app read it: it may
+        # have saved an older copy of the list over it. Those items were not started.
+        # Only its own item left.
+        mem = {"held": ["own", "old"], "pending": {"x": self.T0, "y": self.T0}, "confirmed": []}
+        new, gone = db.resolve(mem, ["own"], False, False)
         self.assertEqual((new["held"], new["pending"], gone), (["own"], {}, ["old"]))
 
-    def test_a_write_that_sat_there_for_a_while_was_read(self):
-        # A later look still found the file as written, two minutes on: whenever the
-        # app opened that list afterwards, it read the write. So x was started.
-        mem = {"held": ["own"], "pending": {"x": self.T0}, "ours_seen_at": self.T0 + db.SETTLE_SECONDS}
-        self.assertEqual(db.resolve(mem, ["own"], False, self.T0 + 900)[1], ["x"])
-        mem["ours_seen_at"] = self.T0 + db.SETTLE_SECONDS - 1
-        self.assertEqual(db.resolve(mem, ["own"], False, self.T0 + 900)[1], [])
+    def test_a_confirmed_write_was_read(self):
+        # After x was written the app was still on another account, so it read x when
+        # it signed in here: x is missing from its save because it was started. The
+        # later write was not confirmed, so `late` was never there for the app.
+        mem = {"held": ["own"], "pending": {"x": self.T0, "late": self.T0 + 9}, "confirmed": ["x"]}
+        self.assertEqual(db.resolve(mem, ["own"], False, False)[1], ["x"])
 
-    def test_an_older_write_is_proven_by_a_newer_one(self):
+    def test_looks_at_the_signed_in_accounts_own_list_confirm_nothing(self):
+        # The app opened this list a moment before x was written into it. However long
+        # the file then sits there untouched, the app never had x: when it saves its
+        # own copy, x was not started.
+        mem = {"held": ["own"], "pending": {"x": self.T0}, "confirmed": []}
+        for _look in range(3):          # the background sync, every ten minutes
+            mem, gone = db.resolve(mem, ["own", "x"], True, False)
+            self.assertEqual(gone, [])
+        self.assertEqual(db.resolve(mem, ["own", "w2"], False, False)[1], [])
+
+    def test_an_older_write_is_shown_by_a_newer_one(self):
         # y came with a later write and is still there, so the app read that write
-        # and with it the earlier one: x was started. z came later still: no proof.
+        # and with it the earlier one: x was started. z came later still: not known.
         mem = {"held": [], "pending": {"x": self.T0, "y": self.T0 + 10, "z": self.T0 + 20},
-               "ours_seen_at": self.T0 + 20}
-        self.assertEqual(db.resolve(mem, ["y"], False, self.T0 + 30)[1], ["x"])
+               "confirmed": []}
+        self.assertEqual(db.resolve(mem, ["y"], False, False)[1], ["x"])
 
 
 if __name__ == "__main__":
