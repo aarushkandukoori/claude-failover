@@ -622,6 +622,28 @@ def _block(st, name, family, now=None):
     return "ok", None
 
 
+def included_usage_first(cfg, names):
+    """Paid extra usage only when no account has usage of its own left.
+
+    `names` are the accounts that can run now, in the order they are tried. An
+    account past its limit with extra usage turned on is never refused, so nothing
+    here ever marks it as limited: it would be picked like any other and bill. The
+    watcher's last usage reading knows which accounts those are, and they move
+    behind the rest. Nothing is dropped: when every account is full, the one that
+    bills is still used, last. With one name, no reading, no account_switch or any
+    error, the order comes back as it was. No call is made (saved readings only)."""
+    if len(names) < 2:
+        return names
+    try:
+        import account_switch
+        paid = account_switch.billing_accounts(cfg)
+    except Exception:
+        return names
+    if not paid or all(n in paid for n in names):
+        return names
+    return [n for n in names if n not in paid] + [n for n in names if n in paid]
+
+
 def plan_accounts(cfg, mode, family=None, pinned=None):
     """Return (usable_now, blocked_sorted_by_when_they_free_up)."""
     if pinned:
@@ -641,7 +663,7 @@ def plan_accounts(cfg, mode, family=None, pinned=None):
         else:
             blocked.append((until, name))
     blocked.sort(key=lambda x: x[0])
-    return usable, [n for _, n in blocked]
+    return included_usage_first(cfg, usable), [n for _, n in blocked]
 
 
 def record_verdict(cfg, name, verdict, family=None, spare=False, login_expires_at=None):
@@ -1343,6 +1365,109 @@ def add_opts(argv, extra):
     return argv + extra
 
 
+PAID_MODEL = "opus"       # every run on paid extra usage uses this model
+
+
+def paid_model(cfg):
+    """The model for runs on paid extra usage: "extra_usage_model" in the config,
+    "opus" when that is not set. false, null or "" turns the rule off."""
+    value = cfg.get("extra_usage_model", PAID_MODEL) if isinstance(cfg, dict) else PAID_MODEL
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def bills_extra_usage(cfg, name):
+    """True when the last usage reading says `name` bills extra usage, or may start
+    to before the next reading (account_switch.billing_accounts). Saved readings
+    only, no call; no reading, no account_switch or any error is False."""
+    try:
+        import account_switch
+        return name in account_switch.billing_accounts(cfg)
+    except Exception:
+        return False
+
+
+def set_model_option(argv, model):
+    """argv with the model set to `model`. A --model the caller wrote is replaced
+    where it stands (taking it out would let an option before it swallow what
+    follows, a prompt for example); when there is none, `--model model` goes at the
+    end, or right before a `--` terminator. Everything after the terminator, and
+    the value of every other one-value option, is never looked at. A --model that
+    is the last word with no value is left as it is: claude rejects that itself."""
+    out, i, found = [], 0, False
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--":
+            if not found:
+                out += ["--model", model]
+                found = True
+            out += argv[i:]
+            break
+        name, eq, _ = tok.partition("=")
+        if name == "--model":
+            found = True
+            if eq:
+                out.append("--model=%s" % model)
+                i += 1
+            elif i + 1 < len(argv):
+                out += ["--model", model]
+                i += 2
+            else:
+                out.append(tok)
+                i += 1
+            continue
+        if not eq and name in ONE and i + 1 < len(argv):
+            out += [tok, argv[i + 1]]           # another option's value, whatever it says
+            i += 2
+            continue
+        out.append(tok)
+        i += 1
+    if not found:
+        out += ["--model", model]
+    return out
+
+
+def runs_paid_model(cfg, asked, model):
+    """True when the run would use the paid model anyway, so nothing has to change:
+    the model the caller named, or else the settings' default, is of the same family
+    (any Opus when the paid model is "opus"). "opusplan" does not count: it does part
+    of the work on Sonnet."""
+    if not (isinstance(asked, str) and asked):
+        asked = read_json(Path(cfg["default_config_dir"]) / "settings.json", {}).get("model")
+    if not (isinstance(asked, str) and asked):
+        return False
+    if "plan" in asked.lower():
+        return False
+    family = family_of(model)
+    return family_of(asked) == family if family else asked.lower() == model.lower()
+
+
+def paid_model_argv(cfg, name, argv):
+    """Every run that lands on paid extra usage uses Opus.
+
+    Returns argv, changed only when account `name` bills extra usage (or may start
+    to) and the run would use another model: the settings' default when the caller
+    names none, or whatever it names, Sonnet and Haiku included (the rule is: on extra
+    usage, Opus). Then --model is set to the paid model, where the caller's stood.
+    A run that is on Opus already is left alone. So is every run when the account is
+    out of the paid model itself (a model-only limit): then the caller's model is the
+    only one that can run there. Effort and ultracode are not touched here (the
+    shared settings.json sets them for every run). Never raises: on any doubt, argv
+    comes back as it was."""
+    try:
+        model = paid_model(cfg)
+        if not model or not bills_extra_usage(cfg, name):
+            return argv
+        if runs_paid_model(cfg, opt(parse_argv(argv), "--model"), model):
+            return argv
+        family, st = family_of(model), read_state()
+        if family and _block(st, name, None)[0] == "ok" and _block(st, name, family)[0] != "ok":
+            return argv
+        new = set_model_option(argv, model)
+        return argv if new == argv else new
+    except Exception:
+        return argv
+
+
 def build_resume_argv(argv, info, session_id, prompt):
     """Same options as the caller, minus its prompt and session flags, plus --resume."""
     drop = {i for i, _ in info["positionals"]}
@@ -1445,8 +1570,12 @@ def run_headless(cfg, argv, pinned):
         if token:
             env["CLAUDE_CODE_OAUTH_TOKEN"] = token
         attempt_started = dt.datetime.now(dt.timezone.utc)
+        # On an account that bills extra usage this attempt runs on Opus (see
+        # paid_model_argv). Only this attempt: cur_argv stays the caller's.
+        run_argv = paid_model_argv(cfg, name, cur_argv)
+        forced = run_argv is not cur_argv
         try:
-            rc, out, err, secs = run_once(cfg, cur_argv, env, cur_stdin)
+            rc, out, err, secs = run_once(cfg, run_argv, env, cur_stdin)
         except OSError as e:
             note("cannot run %s: %s" % (cfg["real_claude"], e))
             return 127
@@ -1456,11 +1585,12 @@ def run_headless(cfg, argv, pinned):
         out_text = out.decode("utf-8", "replace")
         verdict = classify(rc, out_text, err.decode("utf-8", "replace"))
         try:
-            record_verdict(cfg, name, verdict, family, spare,
+            record_verdict(cfg, name, verdict, family_of(paid_model(cfg)) if forced else family, spare,
                            login_expires_at=None if spare else credential_expiry(out_text))
             log_event("run", account=name, kind=verdict["kind"], rc=rc, seconds=round(secs, 1),
                       cwd=os.getcwd(), text=verdict.get("text"),
-                      **({"spare_token": True} if spare else {}))
+                      **({"spare_token": True} if spare else {}),
+                      **({"paid_model": paid_model(cfg)} if forced else {}))
             if verdict["kind"] == "auth":
                 warn_logged_out(cfg, name, verdict, spare)
         except Exception as e:  # bookkeeping must never change what the caller sees
@@ -1566,9 +1696,18 @@ def warn_logged_out(cfg, name, verdict, spare=False):
         notify("Claude: %s spare token refused" % name,
                "Make a new one: claude-accounts token %s" % name)
     else:
+        bills = ""
+        try:
+            # Its jobs now go to whatever account is left. Say so when that one bills.
+            import account_switch
+            others = [n for n in plan_accounts(cfg, "headless")[0] if n != name]
+            if others and not has_spare and all(n in account_switch.billing_accounts(cfg) for n in others):
+                bills = ". Until then jobs run on %s, which bills extra usage" % others[0]
+        except Exception:
+            bills = ""
         notify("Claude: %s is logged out" % name,
-               "Fix: claude-accounts login %s%s" % (
-                   name, " (headless runs use its spare token meanwhile)" if has_spare else ""))
+               "Fix: claude-accounts login %s%s%s" % (
+                   name, " (headless runs use its spare token meanwhile)" if has_spare else "", bills))
 
 
 # --------------------------------------------------------------------------
@@ -1774,7 +1913,8 @@ def main(argv):
             except Exception:
                 pass
             ensure_profile_links(cfg, name)
-            os.execve(cfg["real_claude"], [cfg["real_claude"]] + argv, child_env(cfg, name))
+            os.execve(cfg["real_claude"], [cfg["real_claude"]] + paid_model_argv(cfg, name, argv),
+                      child_env(cfg, name))
         os.execve(cfg["real_claude"], [cfg["real_claude"]] + argv,
                   job_env(cfg, argv[argv.index(sub) + 1:], pinned))
     if sub:
@@ -1794,7 +1934,12 @@ def main(argv):
         return run_headless(cfg, argv, pinned)
     name = pick_interactive(cfg, info, pinned)
     ensure_profile_links(cfg, name)
-    os.execve(cfg["real_claude"], [cfg["real_claude"]] + argv, child_env(cfg, name))
+    # A chat on an account that bills extra usage runs on Opus. That also covers a
+    # chat the hook handed to Terminal: its script starts this wrapper, pinned.
+    run_argv = paid_model_argv(cfg, name, argv)
+    if run_argv is not argv and os.isatty(2):
+        note("%s is at or near its limit with extra usage on: using %s" % (name, paid_model(cfg)))
+    os.execve(cfg["real_claude"], [cfg["real_claude"]] + run_argv, child_env(cfg, name))
     return 0  # not reached
 
 
@@ -1936,7 +2081,10 @@ def notify(title, message):
 
 
 def write_handoff_script(cfg, session_id, cwd, frm, to, permission_mode, verdict, kind,
-                         model=None):
+                         model=None, paid=False):
+    """The Terminal script that continues one chat on account `to`. paid=True adds
+    one line saying that `to` is at its own limit with extra usage on, so the chat
+    may cost extra usage; nothing else about the script changes."""
     hdir = handoff_dir()
     hdir.mkdir(parents=True, exist_ok=True)
     stamp = now_local().strftime("%Y%m%d-%H%M%S")
@@ -1954,12 +2102,17 @@ def write_handoff_script(cfg, session_id, cwd, frm, to, permission_mode, verdict
     if model:
         cmd += ["--model", model]
     cmd.append(prompt)
+    note = ["printf '  %%s\\n\\n' %s" % shlex.quote(
+        "Note: extra usage is on for %s and it is at or near its limit, so this may cost "
+        "extra usage." % to)
+    ] if paid else []
     body = "\n".join([
         "#!/bin/bash",
         "# claude-failover handoff %s: %s hit its usage limit, continuing on %s." % (stamp, frm, to),
         "export PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
         "cd %s 2>/dev/null || cd ~" % shlex.quote(cwd or os.path.expanduser("~")),
         "printf '\\n  %s is out of usage. Continuing this conversation on %s...\\n\\n'" % (frm, to),
+    ] + note + [
         "CLAUDE_FAILOVER_ACCOUNT=%s exec %s" % (shlex.quote(to), " ".join(shlex.quote(c) for c in cmd)),
         "",
     ])
@@ -2022,6 +2175,16 @@ def hook_main(stdin_text=None, env=None, open_terminal=True, print_run=None):
         record_verdict(cfg, frm, verdict, family)
     if kind == "headless":
         return 0  # the wrapper (or the caller) handles -p runs
+    if open_terminal:
+        try:
+            # One watcher pass now, in the background: it brings the usage numbers,
+            # the account order and the notices up to date (see account_switch.py).
+            # It runs whether or not this chat is handed off, and it opens no window
+            # unless the config says "at_limit": "app". Off unless the watcher is installed.
+            import account_switch
+            account_switch.on_limit(cfg)
+        except Exception:
+            pass   # the hook must never fail
     # Both kinds default to on: a config that names only one of them keeps the other.
     handoff = cfg["handoff"] if isinstance(cfg.get("handoff"), dict) else {}
     if (kind == "desktop" and not handoff.get("from_desktop", True)) or (
@@ -2061,6 +2224,16 @@ def hook_main(stdin_text=None, env=None, open_terminal=True, print_run=None):
         notify("Claude: every account is out of usage", "; ".join(parts) or "No fallback account available")
         log_event("handoff_skipped", reason="no_account", session=session_id)
         return 0
+    paid = False
+    try:
+        # A note only, never a reason to hold the chat back: the account it moves to
+        # may itself be at or near its limit with extra usage on (the same accounts
+        # the pick puts last). The watcher's last reading knows (no call is made here). Asked before the hand-off is
+        # recorded, so nothing in it can leave a recorded hand-off without a window.
+        import account_switch
+        paid = to in account_switch.billing_accounts(cfg)
+    except Exception:
+        paid = False   # no reading or no account_switch: say nothing
     with edit_state() as st:
         # Hand a chat off once per limit window: until the source account resets,
         # later failures there only get a notification. Unknown reset: 6 hours.
@@ -2075,9 +2248,9 @@ def hook_main(stdin_text=None, env=None, open_terminal=True, print_run=None):
             for k in sorted(st["handoffs"], key=key)[:-200]:
                 st["handoffs"].pop(k, None)
     path = write_handoff_script(cfg, session_id, payload.get("cwd"), frm or "this account", to,
-                                perm, verdict, kind, use_model)
+                                perm, verdict, kind, use_model, paid=paid)
     log_event("handoff", frm=frm, to=to, model=use_model, session=session_id, script=str(path),
-              session_kind=kind)
+              session_kind=kind, **({"paid_extra": True} if paid else {}))
     if open_terminal:
         try:
             subprocess.Popen(["/usr/bin/open", "-a", "Terminal", str(path)],
@@ -2087,7 +2260,9 @@ def hook_main(stdin_text=None, env=None, open_terminal=True, print_run=None):
         except OSError:
             opened = False
         notify("Claude: %s is out of usage" % (frm or "this account"),
-               "Continuing the conversation on %s in Terminal." % to)
+               "Continuing the conversation on %s in Terminal.%s" % (
+                   to, " Extra usage is on for %s and it is at or near its limit: this may cost "
+                       "extra usage." % to if paid else ""))
         if opened and desktop_sync_on(cfg):
             # The desktop app lists chats per account. Copying the records now
             # means this chat is already in the list when the app is switched
@@ -2229,8 +2404,10 @@ def accounts_status(cfg, as_json=False):
         print(json.dumps({"accounts": rows, "order": cfg["order"],
                           "config": cfg["_config_path"]}, indent=2))
         return 0
+    # The order accounts are really tried in: one on paid extra usage goes last.
     print("Claude accounts (headless order: %s; chat order: %s)" % (
-        " -> ".join(cfg["order"]["headless"]), " -> ".join(cfg["order"]["interactive"])))
+        " -> ".join(included_usage_first(cfg, list(cfg["order"]["headless"]))),
+        " -> ".join(included_usage_first(cfg, list(cfg["order"]["interactive"])))))
     for r in rows:
         line = "  %-12s %-18s" % (r["account"], r["health"].upper())
         if r["logged_in"]:
@@ -2292,6 +2469,12 @@ def accounts_status(cfg, as_json=False):
             line = None
         if isinstance(line, str) and line:
             print(line)
+    try:
+        import account_switch
+        for line in account_switch.status_lines(cfg):
+            print(line)
+    except Exception:   # also ImportError: status must work without it
+        pass
     return 0
 
 
@@ -2654,9 +2837,13 @@ ACCOUNTS_USAGE = """usage: claude-accounts <command>
   argspec                              rebuild argspec.json from the installed claude
   hook install|uninstall|status        the StopFailure hook in settings.json
   sync [--dry-run] [--quiet] [--json]  list desktop app chats under every account
-  sync install [--every MINUTES] | sync uninstall | sync status"""
+  sync install [--every MINUTES] | sync uninstall | sync status
+  usage [--fresh] [--json]             how much of its week each account has used
+  switch [--to ACCOUNT] [--check]      by hand: move the app itself (stops working chats)
+  watch [install|uninstall|status]     background watcher: usage warnings, account order"""
 ACCOUNTS_COMMANDS = {"status", "init", "add", "setup", "login", "logged-in", "token", "test",
-                     "clear", "mark", "log", "argspec", "hook", "sync"}
+                     "clear", "mark", "log", "argspec", "hook", "sync",
+                     "usage", "switch", "watch"}
 NEEDS_CLAUDE = {"status", "login", "token", "test", "argspec"}
 
 
@@ -2696,6 +2883,13 @@ def accounts_main(argv):
             print("desktop sync is not available (%s)" % e)
             return 1
         return desktop_sync.cli(cfg, rest)
+    if cmd in ("usage", "switch", "watch"):
+        try:
+            import account_switch
+        except ImportError as e:
+            print("account switching is not available (%s)" % e)
+            return 1
+        return account_switch.cli(cfg, cmd, rest)
     if cmd == "setup":
         worst = 0
         for a in cfg["accounts"]:

@@ -22,6 +22,7 @@ Claude subscription plans have usage limits: one that resets every few hours and
 - **Desktop chat sync across accounts** - the desktop app lists Code chats per account. `claude-accounts sync` copies each chat's record to every account, so every account lists every chat.
 - **Scheduled tasks on every account** - the desktop app also keeps scheduled tasks per account and runs only the signed-in account's. Each sync copies the signed-in account's task list, with its run times, into the other accounts, so the same tasks are waiting after a switch and runs that already happened are not repeated.
 - **Nothing left behind at a switch** - signing the app out stops every chat that was working, and nothing continues by itself. `claude-accounts sync handover` lists the chats that were cut off, the ones that stopped at a usage limit and the ones that wait for your answer, so the next account can pick them up. The task backlog (task cards you set aside) is copied to the other accounts too, and a sync runs the moment the app is signed out, so the next account starts with everything.
+- **A watcher that only tells, and a guided switch of the app for when you want one** - at a limit the chat handoff above is what takes over, and the app stays signed in where it is. A background watcher reads each account's usage, warns before the app's account runs out and says what will happen, and, with `switch.auto_order` on, keeps background jobs on the account the app is not using. It opens no window by itself. Only you can sign the app in to another account, and signing it out stops every chat that is working in it, so `claude-accounts switch` is a command you run by hand: it checks the other account, syncs, waits for your sign-in and finishes the rest.
 - **Login-expiry early warning and an optional spare token** - CLI logins expire, and headless jobs never see Claude's warning. `claude-accounts status` says when each login ends and when to renew it. An optional one-year spare token keeps headless runs going if a login lapses anyway.
 - **Drop-in** - same arguments, same output, same exit codes, so scripts keep calling `claude`. One difference is on purpose: a `-p` run that names no permission mode gets `--permission-mode default`, so a `permissions.defaultMode` in `settings.json` does not reach headless jobs. Pass `--permission-mode` in a script that needs another mode.
 
@@ -49,7 +50,7 @@ flowchart TD
     H --> C
 ```
 
-A chat that hits a limit goes the same way through the hook, which runs `claude --resume <id> --fork-session` on the next account in a new Terminal window. The full design, with every edge case, is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Desktop sync has its own page: [docs/DESKTOP-SYNC.md](docs/DESKTOP-SYNC.md).
+A chat that hits a limit goes the same way through the hook, which runs `claude --resume <id> --fork-session` on the next account in a new Terminal window. The full design, with every edge case, is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Desktop sync has its own page: [docs/DESKTOP-SYNC.md](docs/DESKTOP-SYNC.md), and so does switching the desktop app: [docs/SWITCHING.md](docs/SWITCHING.md).
 
 It is plain Python 3.9 standard library, run by the system `/usr/bin/python3`. There is nothing to install with pip.
 
@@ -63,8 +64,9 @@ desktop_sync.py            desktop chat sync
 desktop_tasks.py           rules for mirroring desktop scheduled tasks
 desktop_backlog.py         rules for mirroring the desktop task backlog
 desktop_handover.py        which chats were left in the middle of their work
+account_switch.py          usage readings, the guided app switch, the watcher
 tests/                     unittest suite, fake claude binary, fake keychain tool
-docs/                      architecture and desktop sync write-ups
+docs/                      architecture, desktop sync and switching write-ups
 ```
 
 ## Quick start
@@ -113,6 +115,9 @@ To remove it: `claude-accounts hook uninstall`, `claude-accounts sync uninstall`
 | `claude-accounts sync install [--every MINUTES]`, `sync uninstall`, `sync status` | Sync in the background with a LaunchAgent: every 10 minutes by default, and whenever the app is signed out or in. `sync status` also says whether the scheduled task lists and the task backlogs match, and how many chats there are to pick up. |
 | `claude-accounts sync handover [--json] [--hours N]` | List the chats that were left in the middle of their work in the last 48 hours: cut off by a sign-out, stopped at a usage limit, or waiting for you. It only reads. |
 | `claude-accounts sync auto-restart [on\|off]` | Have the app restart the chats a sign-out cut off, by itself, after a switch. Off by default. `sync restart [--json] [--dry-run]` is the step its pick-up task runs: it claims each cut-off chat once and prints the message to send it. |
+| `claude-accounts usage [--fresh] [--json]` | Each account: how much of its week is used and when it resets. `--fresh` reads every account again with one tiny call each. |
+| `claude-accounts switch [--to ACCOUNT] [--check]` | By hand: move the desktop app to the other account. It checks it, syncs, waits for your sign-in and finishes the rest. Signing the app out stops every chat that is working in it. `--check` only checks. |
+| `claude-accounts watch install [--every MINUTES]`, `watch uninstall`, `watch status` | The background watcher: usage warnings, the account order, finishing a switch of the app it notices. It opens no window unless the config says `"switch": {"at_limit": "app"}`. |
 
 For a single call, `CLAUDE_FAILOVER_ACCOUNT=<name>` pins one account, `CLAUDE_FAILOVER=off` turns failover off and uses the first account of the chat order, and `CLAUDE_FAILOVER_VERBOSE=1` prints failover notes on stderr. Every variable is listed in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#configuration).
 
@@ -138,7 +143,7 @@ To turn it off, set `"desktop_sync": {"scheduled_tasks": false}` in the config. 
 
 ## Picking up after a switch
 
-Signing the desktop app out, which is how you switch accounts, kills every chat that is in the middle of a turn. The app does not mark those chats and does not continue them. What shows it is the transcript: it ends with a tool call or a tool result, where a finished turn ends with a reply.
+Signing the desktop app out, which is how you move the app itself to another account, kills every chat that is in the middle of a turn. A chat that hits a limit does not need this: it continues in Terminal. The app does not mark those chats and does not continue them. What shows it is the transcript: it ends with a tool call or a tool result, where a finished turn ends with a reply.
 
 ```bash
 claude-accounts sync handover    # what was left in the middle of its work
@@ -176,7 +181,7 @@ The tests are plain `unittest`. They run the real entry points against a fake `c
 ## Limitations
 
 - **macOS only** - it relies on the keychain, `launchd`, `kqueue`, Terminal and macOS notifications.
-- **The desktop app cannot switch its own login** - a desktop chat that hits a limit continues in Terminal right away. With desktop sync on, the app also lists the chat under the other account once you sign the app into it. Without sync it is not listed there. Go on in one place only.
+- **The desktop app cannot switch its own login** - a desktop chat that hits a limit continues in Terminal right away. With desktop sync on, the app also lists the chat under the other account once you sign the app into it. Without sync it is not listed there. Go on in one place only. `claude-accounts switch` makes the sign-in the only step that is yours ([docs/SWITCHING.md](docs/SWITCHING.md)).
 - **Paid extra usage** - an account with paid extra usage turned on keeps answering past its plan limit and bills you, so it only fails over at its spending cap.
 - **Buffered output** - a `-p` run's output arrives when the run ends, because the output of a refused attempt has to be replaced.
 - **Desktop sync depends on the app's file layout** - that layout is not a public interface and can change between app versions. Sync copies only records it understands and skips anything else.

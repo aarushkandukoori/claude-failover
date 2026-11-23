@@ -35,6 +35,7 @@ so no user packages or `PYTHON*` variables can change its behaviour).
 | `desktop_tasks.py` | The rules for mirroring scheduled tasks: lists in, lists out, no file access. |
 | `desktop_backlog.py` | The rules for mirroring the task backlog, the same way. |
 | `desktop_handover.py` | How a chat's transcript ends, and so whether the chat was left in the middle of its work. |
+| `account_switch.py` | Usage readings per account, the guided switch of the desktop app, and the watcher that keeps the account order in step. See [SWITCHING.md](SWITCHING.md). |
 | `tests/` | The unittest suite, a fake `claude` binary and a fake keychain tool. |
 
 ## Account folders
@@ -521,11 +522,13 @@ this table lists all of them.
 | `desktop_sync.backlog` | `true` | Each sync copies the signed-in account's task backlog into the other accounts' backlogs. `false` = never write a backlog. See [DESKTOP-SYNC.md](DESKTOP-SYNC.md#the-task-backlog). |
 | `desktop_sync.auto_restart` | `false` | `true` (set by `claude-accounts sync auto-restart on`) keeps a pick-up task armed in the task list of every account the app is not signed in to. It starts when the app signs in there and restarts the chats the sign-out cut off. See [DESKTOP-SYNC.md](DESKTOP-SYNC.md#restarting-cut-off-chats-by-themselves). |
 | `desktop_sync.restart_max`, `desktop_sync.restart_gate` | `3`, none | How many chats one pick-up run restarts at most (1 to 20), and an optional command that is run before any chat is handed out: any exit code but 0 means not now. |
+| `switch.*` | off | The watcher, the automatic account order and the settings that follow the signed-in account. All keys are in [SWITCHING.md](SWITCHING.md#configuration). |
 | `security` | `/usr/bin/security` | The keychain tool used for spare tokens. Tests point it at a fake. |
 
 **Tip** - if your desktop app stays signed in to one account, put that account last in
 `order.headless`. Scripts then use the other account first and leave the desktop
-account's usage for your chats.
+account's usage for your chats. `"switch": {"auto_order": true}` does this by itself and
+follows the app when you switch it ([SWITCHING.md](SWITCHING.md#which-account-background-jobs-use-first)).
 
 Environment variables:
 

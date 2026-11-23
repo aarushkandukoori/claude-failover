@@ -684,6 +684,20 @@ class HookPayloads:
 
 
 class HookTests(HookPayloads, Sandbox):
+    def test_a_limit_starts_a_watcher_pass_whether_or_not_the_chat_is_handed_off(self):
+        import account_switch
+        with mock.patch.object(cf.subprocess, "Popen") as popen, \
+                mock.patch.object(account_switch, "on_limit") as on_limit:
+            rc = cf.hook_main(self.payload(), env=self.desktop_env(), open_terminal=True, print_run=False)
+            self.assertEqual((rc, on_limit.call_count, popen.call_count), (0, 1, 1))
+            # the same chat again: no second handoff, but the pass still starts
+            rc = cf.hook_main(self.payload(), env=self.desktop_env(), open_terminal=True, print_run=False)
+            self.assertEqual((rc, on_limit.call_count, popen.call_count), (0, 2, 1))
+            on_limit.side_effect = RuntimeError("the hook must not fail")
+            rc = cf.hook_main(self.payload(session_id="22222222-2222-3333-4444-555555555555"),
+                              env=self.desktop_env(), open_terminal=True, print_run=False)
+            self.assertEqual(rc, 0)
+
     def test_desktop_limit_hands_off_to_next_account(self):
         rc = cf.hook_main(self.payload(), env=self.desktop_env(), open_terminal=False, print_run=False)
         self.assertEqual(rc, 0)
@@ -702,6 +716,44 @@ class HookTests(HookPayloads, Sandbox):
         # same session again -> no second window
         cf.hook_main(self.payload(), env=self.desktop_env(), open_terminal=False, print_run=False)
         self.assertEqual(len(list(self.handoffs.glob("*.command"))), 1)
+
+    def test_a_target_on_paid_extra_usage_gets_a_note_and_the_chat_still_moves(self):
+        import account_switch
+        cf.hook_main(self.payload(), env=self.desktop_env(), open_terminal=False, print_run=False)
+        plain = list(self.handoffs.glob("*.command"))[0].read_text()
+        self.assertNotIn("extra usage", plain)                       # no reading: the script as it always was
+        sid = "33333333-2222-3333-4444-555555555555"
+        with mock.patch.object(account_switch, "billing_accounts", return_value={"B"}), \
+                mock.patch.object(account_switch, "on_limit"), \
+                mock.patch.object(cf.subprocess, "Popen") as popen, \
+                mock.patch.object(cf, "notify") as notify:
+            rc = cf.hook_main(self.payload(session_id=sid), env=self.desktop_env(),
+                              open_terminal=True, print_run=False)
+        self.assertEqual(rc, 0)
+        script = [p for p in self.handoffs.glob("*.command") if sid[:8] in p.name][0]
+        lines = script.read_text().splitlines()
+        self.assertEqual(len(lines), len(plain.splitlines()) + 1)    # one more line, nothing else
+        self.assertIn("Note: extra usage is on for B and it is at or near its limit, so this may "
+                      "cost extra usage.", lines[-2])
+        self.assertTrue(lines[-1].startswith("CLAUDE_FAILOVER_ACCOUNT=B exec "))
+        self.assertEqual(subprocess.run(["/bin/bash", "-n", str(script)]).returncode, 0)
+        self.assertEqual(popen.call_count, 1)                        # the Terminal window still opens
+        self.assertEqual(popen.call_args[0][0][:3], ["/usr/bin/open", "-a", "Terminal"])
+        self.assertEqual(notify.call_args[0][1], "Continuing the conversation on B in Terminal. "
+                         "Extra usage is on for B and it is at or near its limit: this may cost "
+                         "extra usage.")
+        events = [json.loads(line) for line in (self.state / "events.jsonl").read_text().splitlines()]
+        handoffs = [e for e in events if e.get("event") == "handoff"]
+        self.assertEqual([e.get("paid_extra") for e in handoffs], [None, True])   # logged only when true
+
+    def test_a_reading_that_cannot_be_had_never_holds_a_chat_back(self):
+        import account_switch
+        with mock.patch.object(account_switch, "billing_accounts", side_effect=RuntimeError("boom")):
+            rc = cf.hook_main(self.payload(), env=self.desktop_env(), open_terminal=False, print_run=False)
+        self.assertEqual(rc, 0)
+        body = list(self.handoffs.glob("*.command"))[0].read_text()
+        self.assertIn("CLAUDE_FAILOVER_ACCOUNT=B", body)
+        self.assertNotIn("extra usage", body)
 
     def test_a_handoff_block_naming_one_kind_keeps_the_other_on(self):
         cfg = json.loads(self.cfg_path.read_text())
@@ -1451,7 +1503,7 @@ class TwoClonesTest(unittest.TestCase):
         d = self.tmp / name
         shutil.copytree(str(PROJECT / "bin"), str(d / "bin"))
         for f in ("claude_failover.py", "desktop_sync.py", "desktop_tasks.py",
-                  "desktop_handover.py", "desktop_backlog.py", "install.sh"):
+                  "desktop_handover.py", "desktop_backlog.py", "account_switch.py", "install.sh"):
             shutil.copy2(str(PROJECT / f), str(d / f))
         return d
 
@@ -2055,7 +2107,7 @@ class DocLinkTests(unittest.TestCase):
         # name a real heading of that file, so a reader can find the section.
         pat = re.compile(r"\((README(?:\.md)?|docs/[A-Z-]+\.md)[:,] ([^)\n]+)\)")
         for src in ("claude_failover.py", "desktop_sync.py", "desktop_tasks.py",
-                    "desktop_handover.py", "desktop_backlog.py"):
+                    "desktop_handover.py", "desktop_backlog.py", "account_switch.py"):
             for m in pat.finditer((PROJECT / src).read_text()):
                 doc = "README.md" if m.group(1).startswith("README") else m.group(1)
                 heads = {line.lstrip("#").strip().lower()
