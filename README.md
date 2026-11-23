@@ -20,6 +20,7 @@ Claude subscription plans have usage limits: one that resets every few hours and
 - **Headless failover without doing work twice** - `claude -p` runs try your accounts in order. When an account is refused by a usage limit or a lapsed login, the run moves to the next one: a fresh re-run if no tool ran yet, otherwise a resume of the same session that continues where it stopped.
 - **Chat handoff through a StopFailure hook** - when a chat in the desktop app or in Terminal hits a limit, a Claude Code hook opens Terminal and continues the same conversation, with its full history, on the next account.
 - **Desktop chat sync across accounts** - the desktop app lists Code chats per account. `claude-accounts sync` copies each chat's record to every account, so every account lists every chat.
+- **Scheduled tasks on every account** - the desktop app also keeps scheduled tasks per account and runs only the signed-in account's. Each sync copies the signed-in account's task list, with its run times, into the other accounts, so the same tasks are waiting after a switch and runs that already happened are not repeated.
 - **Login-expiry early warning and an optional spare token** - CLI logins expire, and headless jobs never see Claude's warning. `claude-accounts status` says when each login ends and when to renew it. An optional one-year spare token keeps headless runs going if a login lapses anyway.
 - **Drop-in** - same arguments, same output, same exit codes, so scripts keep calling `claude`. One difference is on purpose: a `-p` run that names no permission mode gets `--permission-mode default`, so a `permissions.defaultMode` in `settings.json` does not reach headless jobs. Pass `--permission-mode` in a script that needs another mode.
 
@@ -58,6 +59,7 @@ bin/claude-failover-hook   the StopFailure hook
 bin/claude-accounts        setup and status
 claude_failover.py         wrapper, hook and claude-accounts logic
 desktop_sync.py            desktop chat sync
+desktop_tasks.py           rules for mirroring desktop scheduled tasks
 tests/                     unittest suite, fake claude binary, fake keychain tool
 docs/                      architecture and desktop sync write-ups
 ```
@@ -104,16 +106,37 @@ To remove it: `claude-accounts hook uninstall`, `claude-accounts sync uninstall`
 | `claude-accounts log [n]` | Show the last n events. |
 | `claude-accounts argspec` | Re-read the option table from the installed `claude` after an update. |
 | `claude-accounts hook install\|uninstall\|status` | Manage the StopFailure hook in `~/.claude/settings.json`. |
-| `claude-accounts sync [--dry-run] [--quiet] [--json]` | Sync desktop app chats once. |
-| `claude-accounts sync install [--every MINUTES]`, `sync uninstall`, `sync status` | Sync in the background with a LaunchAgent, every 10 minutes by default. |
+| `claude-accounts sync [--dry-run] [--quiet] [--json]` | Sync desktop app chats and scheduled tasks once. `--dry-run` prints what would change and writes nothing. |
+| `claude-accounts sync install [--every MINUTES]`, `sync uninstall`, `sync status` | Sync in the background with a LaunchAgent, every 10 minutes by default. `sync status` also says whether the scheduled task lists match. |
 
 For a single call, `CLAUDE_FAILOVER_ACCOUNT=<name>` pins one account, `CLAUDE_FAILOVER=off` turns failover off and uses the first account of the chat order, and `CLAUDE_FAILOVER_VERBOSE=1` prints failover notes on stderr. Every variable is listed in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#configuration).
+
+## Scheduled tasks
+
+The desktop app keeps its scheduled tasks in one file per account and runs only the tasks of the account it is signed in to. Without help, a task made under one account is missing after you switch, and a task copied by hand runs again for the last slot the other account thinks it missed.
+
+Every sync therefore copies the signed-in account's task list into the other accounts:
+
+- **Same task, same id** - the other account's entry is replaced by an exact copy, run times included, so a later switch does not replay runs that already happened.
+- **A task the other account lacks** - added. A one-time task is added only while it is on and its time is still ahead.
+- **A one-time task that already ran** - marked as run on the other account too, so it cannot fire a second time after a switch.
+- **A task only the other account has** - kept and reported. Sync never deletes a task.
+
+The signed-in account's file is only read, because the app holds it in memory and rewrites it. Before another account's list is replaced, a copy of it is saved in the state folder. Sync runs every few minutes, so run `claude-accounts sync` once more just before you switch accounts. To see where things stand:
+
+```bash
+claude-accounts sync --dry-run   # each planned change, nothing written
+claude-accounts sync status      # do the task lists match right now?
+```
+
+To turn it off, set `"desktop_sync": {"scheduled_tasks": false}` in the config. Sync then only lists the tasks that would not run under the signed-in account. The rules, the backups and how to put a list back are in [docs/DESKTOP-SYNC.md](docs/DESKTOP-SYNC.md#scheduled-tasks).
 
 ## Design guarantees
 
 - **Never runs a task twice** - before it moves a run, the wrapper reads that run's transcript. It re-runs the command only when no tool call happened, or when there is no transcript and the refusal came within 90 seconds of the start. Otherwise it resumes the same session and tells the model to continue without repeating finished steps. When it cannot verify what happened, it does not move the run and returns Claude's own message (the usage limit or the login error). That covers runs with `--no-session-persistence` (no transcript), runs with `-c`/`--continue` (the session is not known in advance), resumes that would need a command-line option the wrapper does not know, and accounts whose folder kept its own `projects` instead of the link to `~/.claude/projects` (the wrapper cannot see their transcripts; `claude-accounts add`, `setup` and `status` name such folders). If a resumed run then fails for another reason, the caller never sees that unrelated error, which could invite a blind retry. It gets the original limit message, or a `claude-failover: PARTIAL WORK DONE` line that asks for a check before running the task again.
 - **Never reads or copies your logins** - logins stay in the macOS keychain, where only `claude` itself uses them. The one secret the tool reads is the optional spare token. It is fetched from the keychain when a headless run's login is refused, and for the test calls of `claude-accounts token` and `claude-accounts test`. It is handed to `claude` in its environment and never written to disk.
 - **Never deletes a chat on its own** - desktop sync never touches transcripts. It removes a chat record only to carry over a deletion you made under another account. Every record it replaces or removes is moved to a trash folder first, which keeps the two newest copies of each file for up to 30 days. The first sync that changes anything also saves a backup of the chat records of every account in the config at that time.
+- **Never deletes a scheduled task, never writes the list the app is using** - task sync only reads the signed-in account's list. In the other accounts' lists it adds and replaces entries, after saving a copy of the list as it was, and it reports a task that only another account has instead of removing it.
 - **Quiet for scripts** - a headless run prints what `claude` printed (or the marker above) and adds no notes of its own to stderr, unless `CLAUDE_FAILOVER_VERBOSE=1` is set.
 - **Headless runs and handoffs are logged** - one JSON line per headless attempt, failover, hook event and handoff in `state/events.jsonl` next to the config. Which account a chat starts on is not logged. `claude-accounts log` shows the latest lines.
 

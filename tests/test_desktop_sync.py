@@ -670,6 +670,16 @@ class UntouchedFilesTest(Base):
         r = self.sync()
         self.assertEqual((r["added"], r["updated"], r["retired"]), (1, 1, 1))
         self.assertEqual(others(), before)
+        # With a signed-in account, one of these files may change: the task list of
+        # the account the app is NOT signed in to.
+        (self.dirs["personal"] / "scheduled-tasks.json").write_text(json.dumps(
+            {"scheduledTasks": [{"id": "t", "enabled": False}], "recordedSkips": {}}))
+        self.sign_in(P_ACCT)
+        before = others()
+        r = self.sync()
+        self.assertEqual(r["errors"], [])
+        changed = sorted(k for k, v in others().items() if before[k] != v)
+        self.assertEqual(changed, ["%s/%s/scheduled-tasks.json" % (W_ACCT, W_ORG)])
 
 
 class DryRunTest(Base):
@@ -1058,9 +1068,282 @@ class CliTest(Base):
         self.no_temp_files()
 
 
-class ScheduledTasksTest(Base):
+def cron_task(tid, expr="0 9 * * *", **more):
+    """A repeating scheduled task, shaped like the app's entries."""
+    task = {"id": tid, "displayName": "Task %s" % tid, "cronExpression": expr, "enabled": True,
+            "filePath": "/tasks/%s/SKILL.md" % tid, "createdAt": BASE_MS}
+    task.update(more)
+    return task
 
-    def test_heads_up_for_tasks_of_accounts_not_signed_in(self):
+
+def once_task(tid, fire_at, **more):
+    """A one-time scheduled task."""
+    task = {"id": tid, "displayName": "Task %s" % tid, "fireAt": fire_at, "enabled": True,
+            "filePath": "/tasks/%s/SKILL.md" % tid, "createdAt": BASE_MS}
+    task.update(more)
+    return task
+
+
+def ran(task, at="2026-11-22T14:00:07.000Z", slot="2026-11-22T14:00:00.000Z"):
+    """A one-time task the way the app leaves it after its run."""
+    return dict(task, enabled=False, lastRunAt=at, lastScheduledFor=slot)
+
+
+class TasksBase(Base):
+
+    def tasks_path(self, account):
+        return self.dirs[account] / "scheduled-tasks.json"
+
+    def put_tasks(self, account, tasks, mode=0o600, **top):
+        """Write an account's scheduled-tasks.json the way the app does."""
+        doc = {"scheduledTasks": tasks, "recordedSkips": {}}
+        doc.update(top)
+        path = self.tasks_path(account)
+        path.write_text(json.dumps(doc, indent=2))
+        os.chmod(str(path), mode)
+        return path
+
+    def tasks(self, account):
+        return json.loads(self.tasks_path(account).read_text())["scheduledTasks"]
+
+    def task_backups(self, acct=W_ACCT, org=W_ORG):
+        d = self.state / "desktop-sync" / "task-backups" / acct / org
+        return sorted(d.iterdir()) if d.is_dir() else []
+
+    def ahead(self, hours=1):
+        return int(time.time() * 1000) + hours * 3600 * 1000
+
+    def row(self, report, account="work"):
+        rows = [t for t in report["scheduled_tasks"]["targets"] if t["account"] == account]
+        self.assertEqual(len(rows), 1)
+        return rows[0]
+
+    def changes(self, report, account="work"):
+        return [(c["action"], c["id"]) for c in self.row(report, account)["changes"]]
+
+
+class ScheduledTasksTest(TasksBase):
+    """The signed-in account's task list is copied into the other account's file."""
+
+    def test_tasks_reach_the_other_account(self):
+        mail = cron_task("mail", "0 * * * *", lastRunAt="2026-11-23T03:08:13.063Z",
+                         lastScheduledFor="2026-11-23T03:00:00.000Z",
+                         permissionMode="bypassPermissions", displayName="Café mail")
+        renew = once_task("renew", self.ahead())
+        self.put_tasks("personal", [mail, cron_task("sweep", "35 7 * * *"), renew])
+        skips = {"mail": [{"at": 1794936771886, "reason": "global_limit"}]}
+        target = self.put_tasks("work", [cron_task("mail", lastRunAt="2026-11-22T14:01:00.000Z")],
+                                mode=0o640, recordedSkips=skips, sundayAliasBoundaryStamped=True)
+        self.sign_in(P_ACCT)
+        r = self.sync()
+        self.assertEqual(r["errors"], [])
+        # Same id: replaced, run times included. Missing: added.
+        self.assertEqual(self.tasks("work"), [mail, cron_task("sweep", "35 7 * * *"), renew])
+        self.assertEqual(self.changes(r), [("update", "mail"), ("add", "sweep"), ("add", "renew")])
+        t = r["scheduled_tasks"]
+        self.assertEqual((t["on"], t["source"], t["tasks"], t["note"]), (True, "personal", 3, None))
+        self.assertTrue(self.row(r)["written"])
+        # Everything else in the other account's file is still its own.
+        doc = json.loads(target.read_text())
+        self.assertEqual(list(doc), ["scheduledTasks", "recordedSkips", "sundayAliasBoundaryStamped"])
+        self.assertEqual((doc["recordedSkips"], doc["sundayAliasBoundaryStamped"]), (skips, True))
+        # Written the way the app writes it, as one plain file with the mode it had.
+        self.assertEqual(target.read_bytes(),
+                         json.dumps(doc, indent=2, ensure_ascii=False).encode("utf-8"))
+        st = os.stat(str(target))
+        self.assertEqual((stat.S_IMODE(st.st_mode), st.st_nlink), (0o640, 1))
+        self.no_temp_files()
+        rc, out = self.run_cli()
+        self.assertEqual(rc, 0)
+        self.assertIn("  work: in sync - nothing to copy", out.splitlines())
+
+    def test_signed_in_file_is_never_written(self):
+        # Whatever the other account's file says, and whether the app runs or not.
+        mine = self.put_tasks("personal", [cron_task("mail"), once_task("renew", self.ahead())])
+        os.utime(str(mine), (1700000000, 1700000000))
+        for running in (True, False):
+            self.put_tasks("work", [
+                cron_task("mail", "0 * * * *", lastRunAt="2099-01-01T00:00:00.000Z"),   # "newer"
+                cron_task("only-on-work"),
+                ran(once_task("renew", self.ahead()))])
+            self.sign_in(P_ACCT, running=running)
+            before = snapshot(self.dirs["personal"])
+            r = self.sync()
+            self.assertEqual(r["errors"], [])
+            self.assertEqual(snapshot(self.dirs["personal"]), before, running)
+            self.assertEqual(os.stat(str(mine)).st_mtime_ns, 1700000000 * 10 ** 9)
+            self.assertEqual(self.changes(r), [("update", "mail"), ("update", "renew")])
+            self.assertEqual([t["account"] for t in r["scheduled_tasks"]["targets"]], ["work"])
+        self.assertEqual(len(self.tasks("personal")), 2)
+
+    def test_entry_only_on_the_other_account_is_kept_and_reported(self):
+        stranger = cron_task("stranger", displayName="Only there")
+        old = ran(once_task("old", BASE_MS, displayName="Long done"))
+        self.put_tasks("personal", [cron_task("mail")])
+        self.put_tasks("work", [stranger, old, cron_task("mail")])
+        self.sign_in(P_ACCT)
+        before = self.tasks_path("work").read_bytes()
+        r = self.sync()
+        self.assertEqual(self.tasks_path("work").read_bytes(), before)    # nothing deleted
+        self.assertEqual(self.row(r)["only_there"], [
+            {"id": "stranger", "name": "Only there", "live": True},
+            {"id": "old", "name": "Long done", "live": False}])
+        self.assertEqual((self.row(r)["changes"], self.row(r)["written"]), ([], False))
+        self.assertEqual(r["inactive_scheduled_tasks"], [])    # said by the task lines instead
+        lines = ds.report_lines(r)
+        self.assertIn("  work: only there and still on - Only there (kept: sync never deletes "
+                      "a task)", lines)
+        self.assertIn("  work: only there, finished or off - 1 task (kept)", lines)
+        self.assertFalse([line for line in lines if "heads-up" in line])
+
+    def test_one_time_task_that_ran_cannot_fire_again_after_a_switch(self):
+        due = BASE_MS    # long past: an armed copy would fire the moment the app signs in
+        self.put_tasks("personal", [
+            ran(once_task("ping", due)),
+            ran(once_task("renew-2", due, displayName="Renew the phone app"))])
+        self.put_tasks("work", [
+            once_task("ping", due),
+            once_task("renew", due, displayName="Renew the phone app", permissionMode="auto")])
+        self.sign_in(P_ACCT)
+        r = self.sync()
+        self.assertEqual(sorted(self.changes(r)), [("mark_run", "ping"), ("mark_run", "renew")])
+        ping, renew = self.tasks("work")
+        self.assertEqual(ping, ran(once_task("ping", due)))
+        self.assertEqual(renew, ran(once_task("renew", due, displayName="Renew the phone app",
+                                              permissionMode="auto")))
+        self.assertIn("  work: 2 marked as run", ds.report_lines(r))
+        self.assertEqual(self.changes(self.sync()), [])
+
+    def test_dry_run_prints_the_plan_and_writes_nothing(self):
+        self.put_tasks("personal", [
+            cron_task("mail", "0 * * * *", lastRunAt="2026-11-23T03:08:13.063Z"),
+            cron_task("sweep", "35 7 * * *"),
+            ran(once_task("ping", BASE_MS))])
+        self.put_tasks("work", [cron_task("mail"), once_task("ping", BASE_MS),
+                                cron_task("stranger")])
+        self.sign_in(P_ACCT)
+        before = snapshot(self.tmp)
+        rc, out = self.run_cli("--dry-run")
+        self.assertEqual(rc, 0)
+        self.assertEqual(snapshot(self.tmp), before)
+        self.assertFalse(self.state.exists())
+        lines = out.splitlines()
+        self.assertIn("Scheduled tasks (copied from personal, the signed-in account) - dry run, "
+                      "nothing written", lines)
+        self.assertIn("  work: 1 to add, 1 to update, 1 to mark as run", lines)
+        self.assertIn("    update - Task mail: cronExpression 0 9 * * * -> 0 * * * *, "
+                      "lastRunAt none -> 2026-11-23T03:08:13.063Z", lines)
+        self.assertIn("    add - Task sweep (35 7 * * *)", lines)
+        self.assertIn("    mark as run - Task ping: enabled true -> false, "
+                      "lastRunAt none -> 2026-11-22T14:00:07.000Z, "
+                      "lastScheduledFor none -> 2026-11-22T14:00:00.000Z", lines)
+        self.assertIn("  work: only there and still on - Task stranger (kept: sync never deletes "
+                      "a task)", lines)
+        dry = self.sync(dry_run=True)
+        self.assertEqual(snapshot(self.tmp), before)
+        self.assertEqual((self.row(dry)["written"], self.row(dry)["backup"]), (False, None))
+        real = self.sync()
+        self.assertEqual(self.row(dry)["changes"], self.row(real)["changes"])
+        self.assertIn("  work: 1 added, 1 updated, 1 marked as run", ds.report_lines(real))
+
+    def test_backup_before_the_first_change_of_each_day(self):
+        self.put_tasks("personal", [cron_task("mail", "0 * * * *")])
+        original = self.put_tasks("work", [cron_task("mail")]).read_bytes()
+        self.sign_in(P_ACCT)
+        day1 = dt.datetime(2026, 11, 22, 23, 50, 0, tzinfo=dt.timezone.utc)
+        with mock.patch.object(cf, "now_local", return_value=day1):
+            first = self.sync()
+        backups = self.task_backups()
+        self.assertEqual([b.name for b in backups], ["scheduled-tasks.20261122-235000.json"])
+        self.assertEqual(backups[0].read_bytes(), original)
+        self.assertEqual(stat.S_IMODE(os.stat(str(backups[0])).st_mode), 0o600)
+        self.assertEqual(self.row(first)["backup"], str(backups[0]))
+        self.assertIn("  work: backup - its list as it was: %s" % ds.tilde(backups[0]),
+                      ds.report_lines(first))
+        # More changes the same day: written, and no second backup.
+        self.put_tasks("personal", [cron_task("mail", "0 * * * *"), cron_task("sweep")])
+        with mock.patch.object(cf, "now_local", return_value=day1 + dt.timedelta(minutes=5)):
+            second = self.sync()
+        self.assertEqual((self.row(second)["written"], self.row(second)["backup"]), (True, None))
+        self.assertEqual(self.task_backups(), backups)
+        # The next day's first change saves the list as it was that morning.
+        morning = self.tasks_path("work").read_bytes()
+        self.put_tasks("personal", [cron_task("mail", "0 * * * *")] + [cron_task("sweep", "1 2 * * *")])
+        with mock.patch.object(cf, "now_local", return_value=day1 + dt.timedelta(days=1)):
+            third = self.sync()
+        backups = self.task_backups()
+        self.assertEqual([b.name for b in backups], ["scheduled-tasks.20261122-235000.json",
+                                                    "scheduled-tasks.20261123-235000.json"])
+        self.assertEqual(backups[1].read_bytes(), morning)
+        self.assertEqual(self.row(third)["backup"], str(backups[1]))
+
+    def test_a_list_the_app_changed_is_backed_up_again_the_same_day(self):
+        self.put_tasks("personal", [cron_task("mail", "0 * * * *")])
+        self.put_tasks("work", [cron_task("mail")])
+        self.sign_in(P_ACCT)
+        self.sync()
+        first = self.task_backups()
+        self.assertEqual(len(first), 1)
+        # The app was signed in to work for a while and rewrote its list.
+        by_app = self.put_tasks("work", [cron_task("mail", "5 5 * * *"),
+                                         cron_task("made-on-work")]).read_bytes()
+        r = self.sync()
+        added = [b for b in self.task_backups() if b not in first]
+        self.assertEqual(len(added), 1)
+        self.assertEqual(self.row(r)["backup"], str(added[0]))
+        self.assertEqual(added[0].read_bytes(), by_app)
+        self.assertEqual([t["id"] for t in self.tasks("work")], ["mail", "made-on-work"])
+
+    def test_matching_lists_are_left_alone(self):
+        self.put_tasks("personal", [cron_task("mail"), once_task("renew", self.ahead())])
+        self.put_tasks("work", [cron_task("stale")])
+        self.sign_in(P_ACCT)
+        self.assertTrue(self.row(self.sync())["written"])
+        before = snapshot(self.sessions)
+        backups = self.task_backups()
+        r = self.sync()
+        self.assertEqual(snapshot(self.sessions), before)
+        self.assertEqual((self.row(r)["changes"], self.row(r)["written"], self.row(r)["backup"]),
+                         ([], False, None))
+        self.assertEqual(self.task_backups(), backups)
+
+    def test_account_without_a_task_file_gets_one(self):
+        self.put_tasks("personal", [cron_task("mail")])
+        self.sign_in(P_ACCT)
+        r = self.sync()
+        target = self.tasks_path("work")
+        self.assertEqual(json.loads(target.read_text()), {"scheduledTasks": [cron_task("mail")]})
+        self.assertEqual(stat.S_IMODE(os.stat(str(target)).st_mode), 0o600)
+        self.assertEqual((self.row(r)["written"], self.row(r)["backup"]), (True, None))
+        self.assertEqual(self.task_backups(), [])    # there was nothing to save
+
+    def test_no_task_files_means_no_task_lines(self):
+        self.record("personal", "s1")
+        self.sign_in(P_ACCT)
+        r = self.sync()
+        self.assertEqual((r["errors"], self.row(r)["changes"]), ([], []))
+        self.assertFalse(self.tasks_path("work").exists())
+        self.assertFalse([line for line in ds.report_lines(r) if "cheduled" in line])
+
+    def test_without_a_known_signed_in_account_nothing_is_copied(self):
+        self.put_tasks("personal", [cron_task("mail")])
+        self.put_tasks("work", [cron_task("other")])
+        before = snapshot(self.sessions)
+        for sign_in, why in ((None, "cannot tell which account the app is signed in to"),
+                             (T_ACCT, "the app is signed in to an account that is not in the config")):
+            if sign_in:
+                self.sign_in(sign_in)
+            r = self.sync()
+            self.assertEqual(snapshot(self.sessions), before)
+            t = r["scheduled_tasks"]
+            self.assertEqual((t["source"], t["note"], t["targets"]), (None, why, []))
+            lines = ds.report_lines(r)
+            self.assertIn("Scheduled tasks - not copied: %s" % why, lines)
+            self.assertTrue([line for line in lines if line.startswith("  heads-up - ")])
+
+    def test_config_can_turn_the_copying_off(self):
+        # "scheduled_tasks": false = the old behaviour: a heads-up, and no file is written.
+        self.cfg["desktop_sync"]["scheduled_tasks"] = False
         tasks = self.dirs["personal"] / "scheduled-tasks.json"
         tasks.write_text(json.dumps({"scheduledTasks": [
             {"id": "t1", "displayName": "Weekly report", "enabled": True, "cronExpression": "0 9 * * 1"},
@@ -1070,17 +1353,312 @@ class ScheduledTasksTest(Base):
         ], "recordedSkips": {"t1": []}}))
         (self.dirs["work"] / "scheduled-tasks.json").write_text(json.dumps(
             {"scheduledTasks": [{"id": "w1", "displayName": "Work task", "enabled": True}]}))
-        before = tasks.read_bytes()
+        before = snapshot(self.sessions)
         self.sign_in(W_ACCT, running=False)
         r = self.sync()
         self.assertEqual(r["inactive_scheduled_tasks"], [
             {"account": "personal", "task": "Weekly report"},
             {"account": "personal", "task": "nightly-cleanup"},
             {"account": "personal", "task": "t4-only-id"}])
+        self.assertEqual((r["scheduled_tasks"]["on"], r["scheduled_tasks"]["targets"]), (False, []))
         rc, out = self.run_cli()
         self.assertIn("  heads-up - 3 scheduled tasks only run while the app is signed in as "
                       "personal: Weekly report, nightly-cleanup, t4-only-id", out.splitlines())
-        self.assertEqual(tasks.read_bytes(), before)
+        self.assertNotIn("Scheduled tasks", out)
+        self.assertEqual(snapshot(self.sessions), before)
+        rc, out = self.run_cli("status")
+        self.assertIn("  scheduled tasks - not copied (desktop_sync.scheduled_tasks is false in "
+                      "the config)", out.splitlines())
+
+    def test_lists_this_tool_does_not_understand_are_left_alone(self):
+        self.put_tasks("personal", [cron_task("mail")])
+        self.sign_in(P_ACCT)
+        target = self.tasks_path("work")
+        elsewhere = self.tmp / "elsewhere.json"
+        elsewhere.write_text(json.dumps({"scheduledTasks": []}))
+
+        def not_json():
+            target.write_text("{ half a file")
+
+        def odd_entry():
+            target.write_text(json.dumps({"scheduledTasks": [{"displayName": "no id", "enabled": True}]}))
+
+        def a_link():
+            os.symlink(str(elsewhere), str(target))
+
+        def two_names():
+            self.put_tasks("work", [cron_task("mail", "1 1 * * *")])
+            os.link(str(target), str(self.tmp / "second-name.json"))
+
+        for make in (not_json, odd_entry, a_link, two_names):
+            if os.path.lexists(str(target)):
+                os.unlink(str(target))
+            make()
+            before = snapshot(self.tmp / "desktop")
+            r = self.sync()
+            self.assertEqual(snapshot(self.tmp / "desktop"), before, make.__name__)
+            row = self.row(r)
+            self.assertEqual((row["changes"], row["written"]), ([], False), make.__name__)
+            self.assertTrue(row["note"].startswith("its task list cannot be read ("), row["note"])
+            self.assertEqual(r["errors"], [])
+            self.assertIn("  work: left alone - %s" % row["note"], ds.report_lines(r))
+        self.assertEqual(json.loads(elsewhere.read_text()), {"scheduledTasks": []})
+        self.assertEqual(self.task_backups(), [])
+        # A signed-in list that cannot be read: nothing is copied anywhere.
+        os.unlink(str(target))
+        self.put_tasks("work", [cron_task("other")])
+        self.tasks_path("personal").write_text("{ half a file")
+        before = snapshot(self.sessions)
+        r = self.sync()
+        self.assertEqual(snapshot(self.sessions), before)
+        t = r["scheduled_tasks"]
+        self.assertEqual((t["source"], t["targets"]), (None, []))
+        self.assertEqual(t["note"], "cannot read the task list of personal (not JSON)")
+        self.assertEqual(r["errors"], [])
+
+    def test_a_list_that_changes_during_the_sync_is_not_overwritten(self):
+        self.put_tasks("personal", [cron_task("mail", "0 * * * *")])
+        self.put_tasks("work", [cron_task("mail")])
+        self.sign_in(P_ACCT)
+        real_backup = ds.backup_tasks
+
+        def app_writes_meanwhile(*args):
+            path = real_backup(*args)
+            self.put_tasks("work", [cron_task("mail"), cron_task("just-made")])
+            return path
+
+        with mock.patch.object(ds, "backup_tasks", side_effect=app_writes_meanwhile):
+            r = self.sync()
+        self.assertEqual([t["id"] for t in self.tasks("work")], ["mail", "just-made"])
+        row = self.row(r)
+        self.assertEqual((row["written"], r["errors"]), (False, []))
+        self.assertEqual(row["note"], "its task list changed during the sync (the next run catches up)")
+        self.assertIn("  work: 1 to update - NOT written", ds.report_lines(r))
+        self.no_temp_files()
+        self.assertTrue(self.row(self.sync())["written"])    # the next run
+        self.assertEqual([t["id"] for t in self.tasks("work")], ["mail", "just-made"])
+        self.assertEqual(self.tasks("work")[0]["cronExpression"], "0 * * * *")
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores folder permissions")
+    def test_a_list_that_cannot_be_written_is_an_error(self):
+        self.put_tasks("personal", [cron_task("mail", "0 * * * *")])
+        before = self.put_tasks("work", [cron_task("mail")]).read_bytes()
+        self.sign_in(P_ACCT)
+        os.chmod(str(self.dirs["work"]), 0o500)
+        try:
+            rc, out = self.run_cli("--quiet")
+        finally:
+            os.chmod(str(self.dirs["work"]), 0o755)
+        self.assertEqual(rc, 1)
+        self.assertIn("  error - could not update the scheduled tasks of work", out)
+        self.assertIn("  work: 1 to update - NOT written", out.splitlines())
+        self.assertEqual(self.tasks_path("work").read_bytes(), before)
+        self.no_temp_files()
+
+    def test_no_backup_means_no_write(self):
+        self.put_tasks("personal", [cron_task("mail", "0 * * * *")])
+        before = self.put_tasks("work", [cron_task("mail")]).read_bytes()
+        self.sign_in(P_ACCT)
+        with mock.patch.object(ds, "backup_tasks", side_effect=OSError(28, "No space left on device")):
+            r = self.sync()
+        self.assertEqual(self.tasks_path("work").read_bytes(), before)
+        self.assertEqual(r["errors"], ["could not update the scheduled tasks of work: "
+                                       "No space left on device"])
+        self.assertFalse(self.row(r)["written"])
+
+    def test_sync_status_says_whether_the_lists_match(self):
+        self.put_tasks("personal", [cron_task("mail", "0 * * * *"), cron_task("sweep")])
+        self.put_tasks("work", [cron_task("mail"), ran(once_task("old", BASE_MS))])
+        self.sign_in(P_ACCT)
+        before = snapshot(self.tmp)
+        rc, out = self.run_cli("status")
+        self.assertEqual(snapshot(self.tmp), before)    # status only reads
+        self.assertIn("  scheduled tasks - work is 2 changes behind personal (signed in), the next "
+                      "sync copies them: Task mail, Task sweep", out.splitlines())
+        self.sync()
+        rc, out = self.run_cli("status")
+        self.assertIn("  scheduled tasks - work matches personal (signed in), plus 1 task only on "
+                      "work that is finished or off", out.splitlines())
+        self.put_tasks("work", self.tasks("work") + [cron_task("stranger", displayName="Only there")])
+        rc, out = self.run_cli("status")
+        self.assertIn("  scheduled tasks - DIFFER: only on work and still on: Only there (sync "
+                      "never deletes a task)", out.splitlines())
+        self.assertFalse([line for line in out.splitlines() if "matches" in line])
+        self.put_tasks("work", [cron_task("mail", "0 * * * *"), cron_task("sweep")])
+        rc, out = self.run_cli("status")
+        self.assertIn("  scheduled tasks - work matches personal (signed in)", out.splitlines())
+
+    def test_event_log_gets_a_new_task_but_not_every_run(self):
+        events = self.state / "events.jsonl"
+        self.put_tasks("personal", [cron_task("mail", lastRunAt="2026-11-22T14:00:09.000Z")])
+        self.sign_in(P_ACCT)
+        self.sync()
+        logged = [json.loads(line) for line in events.read_text().splitlines()]
+        self.assertEqual([(e["event"], e["account"], e["added"], e["updated"], e["marked_run"])
+                          for e in logged], [("desktop_task_sync", "work", 1, 0, 0)])
+        # The task ran: its run times are copied, and the log stays as it is.
+        self.put_tasks("personal", [cron_task("mail", lastRunAt="2026-11-23T14:00:09.000Z")])
+        r = self.sync()
+        self.assertTrue(self.row(r)["written"])
+        self.assertEqual(self.tasks("work")[0]["lastRunAt"], "2026-11-23T14:00:09.000Z")
+        self.assertEqual(len(events.read_text().splitlines()), 1)
+        last = json.loads((self.state / "desktop-sync" / "last.json").read_text())
+        self.assertEqual(last["report"]["scheduled_tasks"]["source"], "personal")
+
+    def test_old_task_backups_are_pruned(self):
+        d = self.state / "desktop-sync" / "task-backups" / W_ACCT / W_ORG
+        d.mkdir(parents=True)
+        now = dt.datetime(2026, 11, 22, 12, 0, 0, tzinfo=dt.timezone.utc)
+        old = ["scheduled-tasks.202609%02d-080000.json" % day for day in range(1, 9)]
+        new = ["scheduled-tasks.20261120-080000.json", "scheduled-tasks.20261122-080000-2.json"]
+        for name in old + new + ["notes.txt", "scheduled-tasks.json"]:
+            (d / name).write_text("{}")
+        self.assertEqual(ds.prune_task_backups(self.state / "desktop-sync", now), 5)
+        # The 5 newest stay whatever their age; older ones go after 30 days.
+        self.assertEqual(sorted(p.name for p in d.iterdir()),
+                         sorted(old[5:] + new + ["notes.txt", "scheduled-tasks.json"]))
+        self.assertEqual(ds.prune_task_backups(self.state / "desktop-sync", now), 0)
+        self.assertEqual(ds.prune_task_backups(self.tmp / "no-such-folder", now), 0)
+        # Eleven old copies from one second: -11 is the newest, the plain name the oldest.
+        for p in d.iterdir():
+            p.unlink()
+        same = ["scheduled-tasks.20260901-080000.json"] + [
+            "scheduled-tasks.20260901-080000-%d.json" % n for n in range(2, 12)]
+        for name in same:
+            (d / name).write_text("{}")
+        self.assertEqual(ds.prune_task_backups(self.state / "desktop-sync", now), 6)
+        self.assertEqual(sorted(p.name for p in d.iterdir()), sorted(same[6:]))
+
+    def test_a_merged_list_over_the_size_limit_is_not_written(self):
+        self.put_tasks("personal", [cron_task("mail")])
+        target = self.put_tasks("work", [cron_task("a"), cron_task("b")])
+        before = target.read_bytes()
+        self.sign_in(P_ACCT)
+        limit = len(before) + 10    # each file fits, the two together do not
+        with mock.patch.object(ds, "MAX_TASKS_BYTES", limit):
+            r = self.sync()
+        self.assertEqual(target.read_bytes(), before)
+        self.assertEqual(r["errors"], ["could not update the scheduled tasks of work: the new "
+                                       "list would be over %d bytes" % limit])
+        self.assertEqual(self.task_backups(), [])
+        self.no_temp_files()
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores folder permissions")
+    def test_a_signed_in_folder_that_cannot_be_read_copies_nothing(self):
+        self.put_tasks("personal", [cron_task("mail", "0 * * * *")])
+        before = self.put_tasks("work", [cron_task("mail")]).read_bytes()
+        self.sign_in(P_ACCT)
+        os.chmod(str(self.dirs["personal"]), 0o000)
+        try:
+            r = self.sync()
+            rc, out = self.run_cli("status")
+        finally:
+            os.chmod(str(self.dirs["personal"]), 0o755)
+        self.assertEqual(self.tasks_path("work").read_bytes(), before)
+        note = "cannot read the task list of personal (Permission denied)"
+        self.assertEqual((r["scheduled_tasks"]["source"], r["scheduled_tasks"]["note"]), (None, note))
+        self.assertIn("  scheduled tasks - not copied: %s" % note, out.splitlines())
+
+    def test_a_bug_in_the_task_step_does_not_stop_the_chats(self):
+        self.record("personal", "s1")
+        self.sign_in(P_ACCT)
+        with mock.patch.object(ds, "mirror_tasks", side_effect=RuntimeError("boom")):
+            r = self.sync()
+        self.assertTrue(self.has("work", "s1"))
+        self.assertEqual(r["errors"], ["the scheduled tasks were not copied: boom"])
+
+
+class OrgNotNamedTasksTest(TasksBase):
+    """The config names only the accounts, so each one's organization folder is the
+    one with the chats. The app could be using another one."""
+
+    def setUp(self):
+        super().setUp()
+        for acct in self.cfg["accounts"]:
+            acct["desktop_org_uuid"] = None
+        self.record("personal", "s1")    # the folder with a chat is the one sync picks
+        self.record("work", "s1")
+        self.put_tasks("personal", [cron_task("mail", "0 * * * *")])
+        self.put_tasks("work", [cron_task("mail")])
+        self.sign_in(P_ACCT)
+        self.why = ("it has tasks in more than one organization folder (name the one to use: "
+                    "desktop_org_uuid in the config)")
+
+    def other_org(self, acct, org, tasks):
+        d = self.sessions / acct / org
+        d.mkdir()
+        (d / "scheduled-tasks.json").write_text(json.dumps({"scheduledTasks": tasks}, indent=2))
+        return d
+
+    def test_an_empty_list_in_another_org_folder_changes_nothing(self):
+        # The app leaves such files behind when it switches accounts.
+        self.other_org(P_ACCT, W_ORG, [])
+        self.other_org(W_ACCT, P_ORG, [])
+        r = self.sync()
+        self.assertEqual((r["errors"], self.changes(r)), ([], [("update", "mail")]))
+        self.assertEqual(self.tasks("work"), self.tasks("personal"))
+
+    def test_signed_in_account_with_tasks_in_two_org_folders_copies_nothing(self):
+        self.other_org(P_ACCT, P_ORG2, [cron_task("maybe-the-real-list")])
+        before = snapshot(self.sessions)
+        r = self.sync()
+        self.assertEqual(snapshot(self.sessions), before)
+        t = r["scheduled_tasks"]
+        self.assertEqual((t["source"], t["targets"]), (None, []))
+        self.assertEqual(t["note"], "personal is signed in and " + self.why)
+        # Naming the folder in the config settles it.
+        self.cfg["accounts"][0]["desktop_org_uuid"] = P_ORG
+        self.assertEqual(self.changes(self.sync()), [("update", "mail")])
+
+    def test_other_account_with_tasks_in_two_org_folders_is_left_alone(self):
+        self.other_org(W_ACCT, P_ORG2, [cron_task("maybe-the-real-list")])
+        before = snapshot(self.sessions)
+        r = self.sync()
+        self.assertEqual(snapshot(self.sessions), before)
+        row = self.row(r)
+        self.assertEqual((row["note"], row["changes"], row["written"]), (self.why, [], False))
+        self.assertIn("  work: left alone - " + self.why, ds.report_lines(r))
+        rc, out = self.run_cli("status")
+        self.assertIn("  scheduled tasks - work left alone: " + self.why, out.splitlines())
+
+
+class ThreeAccountTasksTest(TasksBase):
+    ACCOUNTS = (("personal", P_ACCT, P_ORG), ("work", W_ACCT, W_ORG), ("third", T_ACCT, T_ORG))
+
+    def test_every_other_account_gets_the_signed_in_list(self):
+        self.put_tasks("work", [cron_task("mail", "0 * * * *"), cron_task("sweep")])
+        self.put_tasks("personal", [cron_task("mail")])
+        self.sign_in(W_ACCT)
+        before = snapshot(self.dirs["work"])
+        r = self.sync()
+        self.assertEqual(snapshot(self.dirs["work"]), before)
+        self.assertEqual([t["account"] for t in r["scheduled_tasks"]["targets"]],
+                         ["personal", "third"])
+        self.assertEqual(self.changes(r, "personal"), [("update", "mail"), ("add", "sweep")])
+        self.assertEqual(self.changes(r, "third"), [("add", "mail"), ("add", "sweep")])
+        for account in ("personal", "third"):
+            self.assertEqual(self.tasks(account), self.tasks("work"))
+        self.assertEqual(len(self.task_backups(P_ACCT, P_ORG)), 1)
+        self.assertEqual(self.task_backups(T_ACCT, T_ORG), [])
+
+
+class TwoFoldersOneAccountTasksTest(TasksBase):
+    ACCOUNTS = (("personal", P_ACCT, P_ORG), ("personal-team", P_ACCT, P_ORG2),
+                ("work", W_ACCT, W_ORG))
+
+    def test_two_folders_of_the_signed_in_account_copy_nothing(self):
+        # The app's config names the account, not the organization: either folder
+        # could be the one it holds in memory, so neither is a safe source or target.
+        self.put_tasks("personal", [cron_task("mail")])
+        self.put_tasks("personal-team", [cron_task("team")])
+        self.put_tasks("work", [cron_task("other")])
+        self.sign_in(P_ACCT)
+        before = snapshot(self.sessions)
+        r = self.sync()
+        self.assertEqual(snapshot(self.sessions), before)
+        self.assertEqual(r["scheduled_tasks"]["note"],
+                         "the signed-in account has more than one chat folder in the config")
+        self.assertEqual(r["scheduled_tasks"]["targets"], [])
 
 
 class AppDetectionTest(unittest.TestCase):

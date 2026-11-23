@@ -31,7 +31,8 @@ so no user packages or `PYTHON*` variables can change its behaviour).
 | `bin/claude-accounts` | Setup and status: `init`, `add`, `login`, `status`, `hook`, `sync`, and more. |
 | `bin/open-incognito` | The `BROWSER` for `claude-accounts login` when an account sets `login_browser` to `incognito`. Opens the login page in a private Chrome window. |
 | `claude_failover.py` | The wrapper, the hook logic and `claude-accounts`. |
-| `desktop_sync.py` | Copies desktop app chat records between account folders. |
+| `desktop_sync.py` | Copies desktop app chat records between account folders, and the signed-in account's scheduled tasks to the other accounts. |
+| `desktop_tasks.py` | The rules for mirroring scheduled tasks: lists in, lists out, no file access. |
 | `tests/` | The unittest suite, a fake `claude` binary and a fake keychain tool. |
 
 ## Account folders
@@ -225,7 +226,8 @@ limit drops the token attempt too: same account, same limit.
   into place with `os.replace`. A crash never leaves half a JSON file.
 - **Event log** - `state/events.jsonl` gets one JSON line per headless attempt (`run`),
   failover, hook event and handoff (`failover`, `handoff`, `hook_limit`, `hook_ignored`,
-  ...), and one per desktop sync that changed something. Which account a chat starts on is
+  ...), and one per desktop sync that changed something (`desktop_sync` for chats,
+  `desktop_task_sync` for a task list). Which account a chat starts on is
   not logged. `claude-accounts log` prints the tail.
 - **A success does not clear a saved limit.** Past its limit, an account with paid extra
   usage turned on still answers, and bills for it. A limit therefore lasts until its reset
@@ -438,8 +440,11 @@ themselves sit in the shared `~/.claude/projects`. So signing the app into anoth
 account shows an empty sidebar. `claude-accounts sync` copies each chat's small JSON
 record into every account's folder: the union of all chats, the freshest copy winning,
 account-bound fields (connectors, Remote Control) stripped, deletions carried over as
-tombstones, and only additions in the folder the running app is using. A LaunchAgent can
-run it every few minutes. Full details: [DESKTOP-SYNC.md](DESKTOP-SYNC.md).
+tombstones, and only additions in the folder the running app is using. The same run
+copies the signed-in account's scheduled tasks, with their run times, into the other
+accounts' task lists, so the same tasks are there after a switch and runs that already happened are not repeated. It
+never writes the list of the signed-in account and never deletes a task. A LaunchAgent
+can run it every few minutes. Full details: [DESKTOP-SYNC.md](DESKTOP-SYNC.md).
 
 ## Testing
 
@@ -506,6 +511,7 @@ this table lists all of them.
 | `turned_away_seconds` | `90` | A fresh run refused this fast, with no transcript, counts as nothing having run. |
 | `desktop_sync.enabled`, `desktop_sync.interval_minutes` | `false`, `10` | `enabled` (set by `sync install`) makes the hook sync after a handoff and `status` show a desktop chats line. `interval_minutes` is the interval `sync install` uses when you give no `--every`. The LaunchAgent keeps the interval it was installed with, so run `sync install` again after changing it. |
 | `desktop_sync.app_data_dir` | `~/Library/Application Support/Claude` | The desktop app's data folder. Also `$CLAUDE_FAILOVER_DESKTOP_DIR`. |
+| `desktop_sync.scheduled_tasks` | `true` | Each sync copies the signed-in account's desktop scheduled tasks into the other accounts' task lists. `false` = never write a task list, only list the tasks that would not run. See [DESKTOP-SYNC.md](DESKTOP-SYNC.md#scheduled-tasks). |
 | `security` | `/usr/bin/security` | The keychain tool used for spare tokens. Tests point it at a fake. |
 
 **Tip** - if your desktop app stays signed in to one account, put that account last in

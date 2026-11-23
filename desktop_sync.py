@@ -11,14 +11,21 @@ another account its sidebar looks empty, though nothing is lost. This module
 copies the records between the account folders, so every account lists every
 chat: the union of all chats, and when copies differ the freshest one wins.
 
+It also mirrors the desktop scheduled tasks: the list of the account the app is
+signed into is copied into every other account's scheduled-tasks.json, so the
+same tasks are there after a switch (the rules are in desktop_tasks.py).
+
 How it stays safe:
-- It writes only local_<id>.json records and deleted_<id> tombstones, each through
-  a temp file and a rename, and never touches any other file in the app's folders.
+- It writes only local_<id>.json records, deleted_<id> tombstones and the
+  scheduled-tasks.json of accounts the app is not signed into, each through a temp
+  file and a rename, and never touches any other file in the app's folders.
 - The folder of the account the running app is signed into only gets new records.
   The app holds the others in memory and would overwrite a change.
 - Every record it replaces or retires goes to its own trash folder first, and the
   first run that writes saves a tarball of every account folder.
 - A deleted chat stays deleted: its tombstone travels to the other folders.
+- The signed-in account's scheduled-tasks.json is only read. A task list is saved
+  to the state folder before it is replaced, and no task is ever deleted.
 
 Entry points: cli() for `claude-accounts sync ...`, sync() returns a report,
 sync_quietly() for the StopFailure hook, status_line() for `claude-accounts status`.
@@ -42,6 +49,7 @@ import time
 from pathlib import Path
 
 import claude_failover as cf
+import desktop_tasks
 
 REPO = Path(__file__).resolve().parent
 ACCOUNTS_SCRIPT = REPO / "bin" / "claude-accounts"
@@ -54,6 +62,11 @@ TRASH_NAME_RE = re.compile(r"^(.+)\.(\d+)(?:-(\d+))?$")    # <file>.<unix second
 MAX_RECORD_BYTES = 10 * 1024 * 1024    # the app itself skips bigger session files
 MAX_TOMBSTONE_BYTES = 4096             # a tombstone holds one number
 MAX_TASKS_BYTES = 10 * 1024 * 1024
+TASKS_FILE = "scheduled-tasks.json"
+TASKS_WRITTEN_FILE = "tasks-written.json"   # per account: a hash of the task list we wrote last
+TASK_BACKUP_RE = re.compile(r"^scheduled-tasks\.(\d{8})-(\d{6})(?:-(\d+))?\.json$")
+TASK_BACKUP_DAYS = 30
+TASK_BACKUP_KEEP = 5           # newest task-list backups kept per account, whatever their age
 ACTIVITY_FIELDS = ("lastActivityAt", "lastTurnEdgeAt", "latestUserFrameAt")
 # claude.ai connectors and Remote Control belong to one account. A record without
 # these fields makes the app use the account's own settings.
@@ -80,10 +93,12 @@ COUNTS = ("added", "added_needs_restart", "updated", "retired", "stale_in_runnin
 USAGE = """usage: claude-accounts sync [--dry-run] [--quiet] [--json]
        claude-accounts sync install [--every MINUTES] | sync uninstall | sync status
 
-  sync              copy desktop app chats so every account lists every chat
+  sync              copy desktop app chats so every account lists every chat, and
+                    copy the signed-in account's scheduled tasks to the other accounts
   sync install      also sync in the background (every 10 min by default)
   sync uninstall    stop the background sync
-  sync status       the background job and the last sync"""
+  sync status       the background job, the last sync, and whether the
+                    scheduled task lists match"""
 
 
 class Unsafe(Exception):
@@ -366,11 +381,12 @@ def current_ident(path):
         return None
 
 
-def write_file(folder, name, data, times=None, expect=None):
+def write_file(folder, name, data, times=None, expect=None, mode=None):
     """Put `data` at folder/name through a temp file, fsync and a rename, so the
     app never sees half a file. `times` = (atime_ns, mtime_ns) for the new file.
     `expect` = ident() the current file must still have, or None when it must
-    not exist yet; otherwise Changed is raised and nothing is replaced."""
+    not exist yet; otherwise Changed is raised and nothing is replaced. `mode` =
+    the new file's permission bits (0600 when not given)."""
     target = Path(folder) / name
     fd, tmp = tempfile.mkstemp(dir=str(folder), prefix=TEMP_PREFIX)   # mode 0600
     try:
@@ -378,6 +394,8 @@ def write_file(folder, name, data, times=None, expect=None):
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
+        if mode is not None:
+            os.chmod(tmp, mode)
         if times:
             # Set before the rename: the copy never looks newer than its source,
             # so the next run doesn't copy it back (no ping-pong).
@@ -560,6 +578,302 @@ def inactive_tasks(folders, active):
                 if isinstance(label, str) and label:
                     found.append({"account": f["account"], "task": label})
     return found
+
+
+# --------------------------------------------------------------------------
+# Scheduled tasks
+# --------------------------------------------------------------------------
+
+def tasks_on(cfg):
+    """Scheduled tasks are mirrored unless the config says
+    "desktop_sync": {"scheduled_tasks": false}."""
+    return settings(cfg).get("scheduled_tasks") is not False
+
+
+def read_tasks(path):
+    """(document, raw bytes, stat) of a scheduled-tasks.json. A missing file is
+    ({"scheduledTasks": []}, None, None): the app reads that as no tasks. Raises
+    Unsafe or desktop_tasks.NotATaskList for a file to leave alone."""
+    try:
+        data, st = read_regular(path, MAX_TASKS_BYTES)
+    except FileNotFoundError:
+        return {"scheduledTasks": []}, None, None
+    return desktop_tasks.parse(data), data, st
+
+
+def task_key(folder):
+    return "%s/%s" % (folder["account_uuid"], folder["org_uuid"])
+
+
+def backup_tasks(sdir, folder, raw, now):
+    """Save an account's task list as it is, before it is replaced: the first time
+    each day, and whenever the file is not the one this tool wrote last (the app
+    or a person changed it since). Returns the copy's path, or None when no copy
+    was needed."""
+    bdir = private_dir(Path(sdir) / "task-backups")
+    for part in (folder["account_uuid"], folder["org_uuid"]):
+        bdir = private_dir(bdir / part)
+    written = cf.read_json(Path(sdir) / TASKS_WRITTEN_FILE, {})
+    ours = (isinstance(written, dict)
+            and written.get(task_key(folder)) == hashlib.sha256(raw).hexdigest())
+    today = "scheduled-tasks.%s-" % now.strftime("%Y%m%d")
+    if ours and any(name.startswith(today) for name in os.listdir(str(bdir))):
+        return None
+    base = "scheduled-tasks.%s" % now.strftime("%Y%m%d-%H%M%S")
+    dest, n = bdir / (base + ".json"), 2
+    while os.path.lexists(str(dest)):
+        dest, n = bdir / ("%s-%d.json" % (base, n)), n + 1
+    fd = os.open(str(dest), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(raw)
+        f.flush()
+        os.fsync(f.fileno())
+    return dest
+
+
+def remember_tasks_write(sdir, folder, data):
+    """Note the hash of the task list just written, so the next run can tell
+    its own work from a change by the app or a person (see backup_tasks)."""
+    path = Path(sdir) / TASKS_WRITTEN_FILE
+    written = cf.read_json(path, {})
+    written = written if isinstance(written, dict) else {}
+    written[task_key(folder)] = hashlib.sha256(data).hexdigest()
+    cf.atomic_write_json(path, written)
+
+
+def prune_task_backups(sdir, now=None):
+    """Drop task-list backups older than TASK_BACKUP_DAYS, but keep the
+    TASK_BACKUP_KEEP newest of every account whatever their age. The date comes
+    from the file name."""
+    now = cf.now_local() if now is None else now
+    oldest = (now - dt.timedelta(days=TASK_BACKUP_DAYS)).strftime("%Y%m%d")
+    removed = 0
+    for folder, _dirs, files in os.walk(str(Path(sdir) / "task-backups")):
+        copies = [(m.group(1), m.group(2), int(m.group(3) or 1), name)
+                  for name in files for m in [TASK_BACKUP_RE.match(name)] if m]
+        copies.sort(reverse=True)   # newest first: date, time, then the -2, -3 of one second
+        for day, _time, _n, name in copies[TASK_BACKUP_KEEP:]:
+            if day < oldest:
+                try:
+                    os.unlink(os.path.join(folder, name))
+                    removed += 1
+                except OSError:
+                    pass
+    return removed
+
+
+def org_is_named(cfg, account):
+    """True if the config itself says which organization folder the account uses."""
+    accounts = cfg.get("accounts") if isinstance(cfg, dict) else None
+    return any(isinstance(a, dict) and a.get("name") == account and a.get("desktop_org_uuid")
+               for a in (accounts if isinstance(accounts, list) else []))
+
+
+def tasks_in_another_org(cfg, folder):
+    """True if another organization folder of the same account also holds tasks
+    and the config does not say which folder the account uses. The app's config
+    names the account only, so the folder we picked may not be the one the app
+    reads: a stale list would be copied, or the copy would go where the app does
+    not look. Empty lists do not count: the app leaves those behind when it
+    switches accounts."""
+    if org_is_named(cfg, folder["account"]):
+        return False
+    base = Path(folder["path"]).parent
+    try:
+        names = sorted(os.listdir(str(base)))
+    except OSError:
+        return False
+    for name in names:
+        if name == folder["org_uuid"] or not is_real_dir(base / name):
+            continue
+        try:
+            doc, _raw, _st = read_tasks(base / name / TASKS_FILE)
+        except (Unsafe, desktop_tasks.NotATaskList, OSError):
+            return True   # cannot tell what it holds
+        if doc["scheduledTasks"]:
+            return True
+    return False
+
+
+TWO_ORGS = ("it has tasks in more than one organization folder (name the one to use: "
+            "desktop_org_uuid in the config)")
+
+
+def mirror_tasks(cfg, folders, active, sdir, dry_run, errors):
+    """Make every other account's scheduled-tasks.json say what the signed-in
+    account's says, by the rules in desktop_tasks.plan. Returns the
+    "scheduled_tasks" part of the report. The signed-in account's file is only
+    read: the app holds it in memory and rewrites it. A dry run writes nothing."""
+    out = {"on": tasks_on(cfg), "source": None, "tasks": 0, "note": None, "targets": []}
+    if not out["on"]:
+        out["note"] = "turned off in the config (desktop_sync.scheduled_tasks)"
+        return out
+    if len(folders) < 2:
+        return out
+    mine = [f for f in folders if same_id(f["account_uuid"], active)]
+    if len(mine) != 1:
+        out["note"] = ("cannot tell which account the app is signed in to" if active is None
+                       else "the app is signed in to an account that is not in the config"
+                       if not mine else
+                       "the signed-in account has more than one chat folder in the config")
+        return out
+    src = mine[0]
+    if tasks_in_another_org(cfg, src):
+        out["note"] = "%s is signed in and %s" % (src["account"], TWO_ORGS)
+        return out
+    try:
+        doc, _raw, _st = read_tasks(src["path"] / TASKS_FILE)
+    except (Unsafe, desktop_tasks.NotATaskList, OSError) as e:
+        out["note"] = "cannot read the task list of %s (%s)" % (src["account"], why(e))
+        return out
+    out["source"], out["tasks"] = src["account"], len(doc["scheduledTasks"])
+    now_ms = time.time() * 1000
+    for dst in folders:
+        if dst is not src:
+            out["targets"].append(
+                _mirror_into(cfg, doc["scheduledTasks"], dst, now_ms, sdir, dry_run, errors))
+    return out
+
+
+def _mirror_into(cfg, tasks, dst, now_ms, sdir, dry_run, errors):
+    """One other account: plan the changes and, unless it is a dry run, save a
+    copy of its list and write the new one."""
+    row = {"account": dst["account"], "changes": [], "only_there": [], "written": False,
+           "backup": None, "note": None}
+    if tasks_in_another_org(cfg, dst):
+        row["note"] = TWO_ORGS
+        return row
+    try:
+        doc, raw, st = read_tasks(dst["path"] / TASKS_FILE)
+    except (Unsafe, desktop_tasks.NotATaskList, OSError) as e:
+        row["note"] = "its task list cannot be read (%s)" % why(e)
+        return row
+    new_list, row["changes"], row["only_there"] = desktop_tasks.plan(
+        tasks, doc["scheduledTasks"], now_ms)
+    if not row["changes"] or dry_run:
+        return row
+    try:
+        data = desktop_tasks.encode(dict(doc, scheduledTasks=new_list))
+        if desktop_tasks.parse(data)["scheduledTasks"] != new_list:
+            raise ValueError("the new list does not read back as written")
+        if len(data) > MAX_TASKS_BYTES:
+            raise ValueError("the new list would be over %d bytes" % MAX_TASKS_BYTES)
+        if st is not None:
+            backup = backup_tasks(sdir, dst, raw, cf.now_local())
+            row["backup"] = str(backup) if backup else None
+        write_file(dst["path"], TASKS_FILE, data, expect=ident(st) if st is not None else None,
+                   mode=stat.S_IMODE(st.st_mode) if st is not None else None)
+    except Changed:
+        row["note"] = "its task list changed during the sync (the next run catches up)"
+        return row
+    except (OSError, ValueError, desktop_tasks.NotATaskList) as e:
+        errors.append("could not update the scheduled tasks of %s: %s" % (dst["account"], why(e)))
+        return row
+    row["written"] = True
+    try:
+        remember_tasks_write(sdir, dst, data)
+    except (OSError, TypeError, ValueError):
+        pass   # the next run then makes one backup more than needed
+    return row
+
+
+def _field_text(field):
+    """One changed field of a task, as text."""
+    old, new = field["from"], field["to"]
+    if any(v in ("(a list)", "(an object)") for v in (old, new)):
+        return "%s changed" % field["field"]
+
+    def show(v):
+        return "none" if v is None else json.dumps(v) if isinstance(v, bool) else str(v)
+    return "%s %s -> %s" % (field["field"], show(old), show(new))
+
+
+def _change_text(change):
+    """One planned or finished change to a task list, as text."""
+    if change["action"] == "add":
+        return "add - %s (%s)" % (change["name"], change["schedule"])
+    verb = "mark as run" if change["action"] == "mark_run" else "update"
+    return "%s - %s: %s" % (verb, change["name"],
+                            ", ".join(_field_text(f) for f in change["fields"]))
+
+
+def task_lines(r):
+    """What `claude-accounts sync` prints about scheduled tasks."""
+    t = r.get("scheduled_tasks") or {}
+    if not t.get("source"):
+        if t.get("on") and t.get("note") and r["inactive_scheduled_tasks"]:
+            return ["Scheduled tasks - not copied: %s" % t["note"]]
+        return []
+    rows = t["targets"]
+    if not t["tasks"] and not any(row["changes"] or row["only_there"] or row["note"]
+                                  for row in rows):
+        return []   # no account has a task: nothing to say
+    dry = r["dry_run"]
+    lines = ["Scheduled tasks (copied from %s, the signed-in account)%s" % (
+        t["source"], " - dry run, nothing written" if dry else "")]
+    for row in rows:
+        who, changes = row["account"], row["changes"]
+        if not changes and not row["note"]:
+            lines.append("  %s: in sync - nothing to copy" % who)
+        elif changes:
+            done = row["written"]
+            words = (("add", "added", "to add"), ("update", "updated", "to update"),
+                     ("mark_run", "marked as run", "to mark as run"))
+            parts = ["%d %s" % (n, past if done else todo) for action, past, todo in words
+                     for n in [sum(1 for c in changes if c["action"] == action)] if n]
+            lines.append("  %s: %s%s" % (who, ", ".join(parts),
+                                         "" if done or dry else " - NOT written"))
+            lines.extend("    %s" % _change_text(c) for c in changes)
+        if row["note"]:
+            lines.append("  %s: left alone - %s" % (who, row["note"]))
+        live = [o["name"] for o in row["only_there"] if o["live"]]
+        rest = len(row["only_there"]) - len(live)
+        if live:
+            lines.append("  %s: only there and still on - %s (kept: sync never deletes a task)"
+                         % (who, ", ".join(live)))
+        if rest:
+            lines.append("  %s: only there, finished or off - %s (kept)"
+                         % (who, plural(rest, "task")))
+        if row["backup"]:
+            lines.append("  %s: backup - its list as it was: %s" % (who, tilde(row["backup"])))
+    return lines
+
+
+def task_status_lines(cfg):
+    """For `sync status`: do the scheduled task lists match right now? It reads
+    the files and writes nothing. Never raises."""
+    try:
+        ddir = desktop_dir(cfg)
+        folders, _skipped = resolve_folders(cfg, ddir)
+        t = mirror_tasks(cfg, folders, active_account_uuid(ddir), None, True, [])
+    except Exception:
+        return []
+    if not t["on"]:
+        return ["  scheduled tasks - not copied (desktop_sync.scheduled_tasks is false in the config)"]
+    if not t["source"]:
+        return ["  scheduled tasks - not copied: %s" % t["note"]] if t["note"] else []
+    lines = []
+    for row in t["targets"]:
+        who = row["account"]
+        if row["note"]:
+            lines.append("  scheduled tasks - %s left alone: %s" % (who, row["note"]))
+            continue
+        live = [o["name"] for o in row["only_there"] if o["live"]]
+        rest = len(row["only_there"]) - len(live)
+        if row["changes"]:
+            lines.append("  scheduled tasks - %s is %s behind %s (signed in), the next sync copies "
+                         "%s: %s" % (who, plural(len(row["changes"]), "change"), t["source"],
+                                     "it" if len(row["changes"]) == 1 else "them",
+                                     ", ".join(sorted({c["name"] for c in row["changes"]}))))
+        elif not live:
+            lines.append("  scheduled tasks - %s matches %s (signed in)%s" % (
+                who, t["source"],
+                ", plus %s only on %s that %s finished or off" % (
+                    plural(rest, "task"), who, "is" if rest == 1 else "are") if rest else ""))
+        if live:
+            lines.append("  scheduled tasks - DIFFER: only on %s and still on: %s (sync never "
+                         "deletes a task)" % (who, ", ".join(live)))
+    return lines
 
 
 # --------------------------------------------------------------------------
@@ -945,7 +1259,8 @@ def new_report(dry_run):
     for key in COUNTS:
         report[key] = 0
     report.update({"errors": [], "backup": None, "inactive_scheduled_tasks": [],
-                   "by_pair": [], "actions": [], "actions_truncated": False})
+                   "scheduled_tasks": None, "by_pair": [], "actions": [],
+                   "actions_truncated": False})
     return report
 
 
@@ -975,6 +1290,7 @@ def sync(cfg, dry_run=False):
         except (OSError, TypeError, ValueError) as e:
             report["errors"].append("could not save %s: %s" % (tilde(sdir / SEEN_FILE), why(e)))
         prune_trash(sdir)
+        prune_task_backups(sdir)
         _save_last(sdir, report)
         return report
 
@@ -992,6 +1308,7 @@ def _run(cfg, sdir, dry_run):
     running = app_running()
     active = active_account_uuid(ddir)
     folders, report["skipped_accounts"] = resolve_folders(cfg, ddir)
+    resolved = list(folders)   # the task step reads one named file, so it takes them all
     report["app_running"] = running
     for f in folders:
         # The running app holds its signed-in account's chats in memory. When we
@@ -1007,7 +1324,15 @@ def _run(cfg, sdir, dry_run):
     deleted = set().union(*[f["tombstones"] for f in folders]) if folders else set()
     ids = set().union(*[f["records"] for f in folders]) if folders else set()
     report["chats"] = len(ids - deleted)
-    report["inactive_scheduled_tasks"] = inactive_tasks(folders, active)
+    try:
+        tasks = mirror_tasks(cfg, resolved, active, sdir, dry_run, report["errors"])
+    except Exception as e:   # a bug in this step must not stop the chats from syncing
+        tasks = {"on": tasks_on(cfg), "source": None, "tasks": 0, "note": why(e), "targets": []}
+        report["errors"].append("the scheduled tasks were not copied: %s" % why(e))
+    report["scheduled_tasks"] = tasks
+    # Once the lists are mirrored, the task lines say what only another account has.
+    report["inactive_scheduled_tasks"] = ([] if tasks["source"]
+                                          else inactive_tasks(folders, active))
     if len(folders) < 2:
         if not is_real_dir(ddir / "claude-code-sessions"):
             report["note"] = "no desktop app chat folders in %s" % tilde(ddir)
@@ -1058,6 +1383,12 @@ def _save_last(sdir, report):
         fields = {k: report[k] for k in COUNTS}
         fields["errors"] = len(report["errors"])
         cf.log_event("desktop_sync", **fields)
+    for row in (report.get("scheduled_tasks") or {}).get("targets", []):
+        # A task that ran moves its run times every time: no line for that alone.
+        news = [c["action"] for c in row["changes"] if not desktop_tasks.only_run_times(c)]
+        if row["written"] and news:
+            cf.log_event("desktop_task_sync", account=row["account"], added=news.count("add"),
+                         updated=news.count("update"), marked_run=news.count("mark_run"))
 
 
 def sync_quietly(cfg):
@@ -1153,6 +1484,7 @@ def report_lines(r):
     elif not r["by_pair"] and not r["errors"] and not r["stale_in_running_app"] \
             and not r["deleted_elsewhere_live"]:
         lines.append("  in sync - nothing to copy")
+    lines.extend(task_lines(r))
     for e in r["errors"]:
         lines.append("  error - %s" % e)
     return lines
@@ -1485,6 +1817,7 @@ def cmd_status(cfg):
                 _num(r.get("stale_in_running_app")) + _num(r.get("deleted_elsewhere_live")), "change"))
     else:
         lines.append("  last sync - never")
+    lines.extend(task_status_lines(cfg))
     lines.append("  log - %s" % tilde(sync_dir() / "agent.log"))
     print("\n".join(lines))
     return rc
