@@ -142,6 +142,10 @@ def memory(entry):
       confirmed  the pending items the app is taken to read when it next opens
                  the list: after they were written, the app was still signed
                  in to another account (see resolve)
+      wrote      the SHA-256 of the file as this tool wrote it last. The key is
+                 only there after a write: by it the next look can tell that
+                 the app has not saved the list since, also when the note of
+                 that write in tasks-written.json is missing
     An older version kept just the list of keys. A later one kept a time,
     ours_seen_at, which is no longer used: it was also set by looks taken while
     the app was signed in to the list itself, and those tell nothing."""
@@ -154,22 +158,29 @@ def memory(entry):
     number = (int, float)
     pending = {k: float(t) for k, t in pending.items()
                if isinstance(k, str) and isinstance(t, number) and not isinstance(t, bool)}
-    return {"held": sorted({k for k in held if isinstance(k, str)}), "pending": pending,
-            "confirmed": sorted({k for k in confirmed if isinstance(k, str) and k in pending})}
+    mem = {"held": sorted({k for k in held if isinstance(k, str)}), "pending": pending,
+           "confirmed": sorted({k for k in confirmed if isinstance(k, str) and k in pending})}
+    if isinstance(entry.get("wrote"), str) and entry["wrote"]:
+        mem["wrote"] = entry["wrote"]
+    return mem
 
 
-def after_write(mem, new_keys, added, now, elsewhere):
+def after_write(mem, new_keys, added, now, elsewhere, wrote=None):
     """The memory of a list right after this tool wrote it: what it added is
     pending from `now` (unix seconds) on, until the app is seen to hold it.
     `elsewhere` = after the write, the app was still signed in to another
-    account: then everything pending is confirmed (see resolve)."""
+    account: then everything pending is confirmed (see resolve). `wrote` = the
+    SHA-256 of the bytes that were written (see memory)."""
     there = set(new_keys)
     pending = {k: t for k, t in mem["pending"].items() if k in there}
     for k in added:
         pending.setdefault(k, float(now))
     confirmed = set(pending) if elsewhere else set(mem["confirmed"]) & set(pending)
-    return {"held": sorted(set(mem["held"]) & there), "pending": pending,
-            "confirmed": sorted(confirmed)}
+    out = {"held": sorted(set(mem["held"]) & there), "pending": pending,
+           "confirmed": sorted(confirmed)}
+    if wrote:
+        out["wrote"] = wrote
+    return out
 
 
 def resolve(mem, now_keys, still_ours, elsewhere):
@@ -187,8 +198,9 @@ def resolve(mem, now_keys, still_ours, elsewhere):
     nothing: the app holds that list in memory, and an untouched file does not
     say whether it read the write or opened the list a moment before it.
 
-    Otherwise the app saved the list itself, and what it holds now is known. An
-    item counts as having left only if the list held it before. An item this
+    Otherwise the app saved the list itself, and what it holds now is known (the
+    hash of this tool's last write is forgotten with that). An item counts as
+    having left only if the list held it before. An item this
     tool had written there counts as held when it is confirmed, or when the
     app's save kept another item of the same or a later write. Otherwise the app
     may have saved an older copy of the list over the write, and the item was

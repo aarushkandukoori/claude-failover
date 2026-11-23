@@ -130,10 +130,12 @@ USAGE = """usage: claude-accounts sync [--dry-run] [--quiet] [--json]
                     off by a sign-out, stopped by a usage limit) or wait for you
   sync restart      claim the chats a sign-out cut off, each one once, and print
                     the message to send each of them (the pick-up task runs this;
-                    --by-hand hands them out while auto-restart is off)
+                    --by-hand hands them out while auto-restart is off, and
+                    still needs a usage reading)
   sync auto-restart have the app restart those chats by itself after a switch:
-                    the newest 3, and only on an account with a current usage
-                    reading (claude-accounts usage)"""
+                    the newest few per run (3, or desktop_sync.restart_max), only
+                    on an account with a current usage reading (claude-accounts
+                    usage), and only while scheduled tasks are copied"""
 
 
 class Unsafe(Exception):
@@ -990,11 +992,17 @@ def backlog_count(folder_path):
     return len(read_backlog(folder_path)[0]["items"])
 
 
-def still_ours(folder, raw, ours):
+def still_ours(folder, raw, ours, mem=None):
     """True if an account's backlog file is byte for byte what this tool wrote
-    last: the app has not saved it since. `ours` = the hashes of the last writes."""
-    return (raw is not None
-            and ours.get(written_key(folder, "backlog")) == hashlib.sha256(raw).hexdigest())
+    last: the app has not saved it since. `ours` = the hashes of the last writes
+    (tasks-written.json). `mem` = what is remembered about that list
+    (desktop_backlog.memory), which keeps the hash of the last write too: a
+    write whose hash could not be noted, or a tasks-written.json that is gone,
+    must not make this tool's own write look like a save by the app."""
+    if raw is None:
+        return False
+    digest = hashlib.sha256(raw).hexdigest()
+    return digest in (ours.get(written_key(folder, "backlog")), (mem or {}).get("wrote"))
 
 
 def mirror_backlog(cfg, folders, active, sdir, dry_run, errors):
@@ -1031,16 +1039,18 @@ def mirror_backlog(cfg, folders, active, sdir, dry_run, errors):
     # What left the signed-in account's list since it was last looked at. The app
     # holds this list in memory, so finding the file untouched says nothing about
     # what the app has read (the False).
+    src_before = desktop_backlog.memory(seen.get(task_key(src)))
     src_memory, gone = desktop_backlog.resolve(
-        desktop_backlog.memory(seen.get(task_key(src))), desktop_backlog.keys(doc["items"]),
-        still_ours(src, raw, ours), False)
+        src_before, desktop_backlog.keys(doc["items"]), still_ours(src, raw, ours, src_before), False)
     ddir = desktop_dir(cfg)
 
     def app_still_here():
-        """Asked right after a write into another account's list: is the app still
-        signed in to the account this run copies from? It names the account it
-        signs in to before it reads that account's lists, so a yes means it has
-        not opened the list that was just written."""
+        """Asked right before and right after a write into another account's
+        list: is the app still signed in to the account this run copies from? It
+        names the account it signs in to before it reads that account's lists.
+        A no before the write means the list is left alone: the app may have
+        opened it already. A yes after the write means the app has not opened the
+        list that was just written. Not being able to tell counts as no."""
         try:
             return same_id(active_account_uuid(ddir), src["account_uuid"])
         except Exception:
@@ -1073,7 +1083,7 @@ def _backlog_into(cfg, items, gone, dst, now, sdir, dry_run, errors, seen, ours,
     list from here on (desktop_backlog.memory), or None when the list could not
     be read). `gone` = the keys that left the signed-in account's list.
     `app_still_here()` = the app is still signed in to the account being copied
-    from: asked after a write, see desktop_backlog.resolve."""
+    from: asked before and after a write, see desktop_backlog.resolve."""
     row = {"account": dst["account"], "added": [], "removed": [], "skipped": [], "only_there": 0,
            "written": False, "backup": None, "note": None}
     if tasks_in_another_org(cfg, dst, backlog_count):
@@ -1091,9 +1101,22 @@ def _backlog_into(cfg, items, gone, dst, now, sdir, dry_run, errors, seen, ours,
     # the file is still what this tool wrote, the app, signed in elsewhere when this
     # run began, reads those items at its next sign-in there (the True).
     old_keys = desktop_backlog.keys(doc["items"])
+    before = desktop_backlog.memory(seen.get(task_key(dst)))
     remembered, _left = desktop_backlog.resolve(
-        desktop_backlog.memory(seen.get(task_key(dst))), old_keys, still_ours(dst, raw, ours), True)
+        before, old_keys, still_ours(dst, raw, ours, before), True)
     if not (row["added"] or row["removed"]) or dry_run:
+        return row, remembered
+    if not app_still_here():
+        # The app has moved on since this run began, maybe to this very account: it
+        # may have opened this list already, and what is written now it might never
+        # read. The next run copies from the account the app is signed in to then. If
+        # that is this account, what this run would have removed here is still here
+        # and goes back to the other list: kept once too often, never lost.
+        row["note"] = ("the app's account changed during the sync or could not be read: nothing "
+                       "was written, and the next run copies from the account the app is on then")
+        if row["removed"]:
+            row["note"] += (" (a card that was started or dropped just before the switch may "
+                            "come back once)")
         return row, remembered
     folder = dst["path"] / BACKLOG_DIR
     try:
@@ -1119,13 +1142,14 @@ def _backlog_into(cfg, items, gone, dst, now, sdir, dry_run, errors, seen, ours,
     try:
         remember_tasks_write(sdir, dst, data, "backlog")
     except (OSError, TypeError, ValueError):
-        pass   # the next run then makes one backup more than needed
+        pass   # the next run makes one backup more than needed; the list's own memory
+        #        keeps the hash too (below), so the write is still known as this tool's
     # What was added is pending there until the app is seen to have taken it over. A
-    # sign-in to that account while this run was under way may have read the list
-    # just before the write: only an app that is still here afterwards confirms it.
+    # sign-in to that account in the moment of the write may have read the list just
+    # before it: only an app that is still here afterwards confirms the write.
     new_keys = desktop_backlog.keys(new_list)
     return row, desktop_backlog.after_write(remembered, new_keys, set(new_keys) - set(old_keys), now,
-                                            app_still_here())
+                                            app_still_here(), hashlib.sha256(data).hexdigest())
 
 
 def backlog_lines(r):
@@ -1831,10 +1855,20 @@ def restart_status_lines(cfg):
                      "(claude-accounts sync auto-restart on)"]
             waiting = armed_pickups(cfg)
             if waiting:
-                lines.append("  auto-restart - a pick-up task still waits on %s: a sync switches it "
-                             "off, and if it starts first it restarts nothing" % ", ".join(waiting))
+                # A sync leaves every task list alone while the task copying is off.
+                how = ("a sync switches it off" if tasks_on(cfg) else
+                       "`claude-accounts sync auto-restart off` switches it off (a sync does not, "
+                       "while copying scheduled tasks is turned off)")
+                lines.append("  auto-restart - a pick-up task still waits on %s: %s, and if it "
+                             "starts first it restarts nothing" % (", ".join(waiting), how))
             return lines
         if not tasks_on(cfg):
+            waiting = armed_pickups(cfg)
+            if waiting:   # armed before the task copying was turned off: it still starts
+                return ["  auto-restart - on: a pick-up task armed earlier still waits on %s and "
+                        "starts at the next sign-in there. Nothing new is armed while copying "
+                        "scheduled tasks is turned off in the config (desktop_sync.scheduled_tasks)"
+                        % ", ".join(waiting)]
             return ["  auto-restart - on, but nothing is armed while copying scheduled tasks is "
                     "turned off in the config (desktop_sync.scheduled_tasks)"]
         ddir = desktop_dir(cfg)
@@ -1856,7 +1890,13 @@ def restart_status_lines(cfg):
             elif not usable:
                 lines.append("  auto-restart - on, but not armed for %s: %s" % (f["account"], why_not))
             else:
-                lines.append("  auto-restart - on, the next sync arms it for %s" % f["account"])
+                # "The next sync" only comes by itself from a background job that works.
+                minutes, script = installed_job()
+                hint = ("" if minutes and not job_is_broken(script) else
+                        " (the background sync is broken: claude-accounts sync install)" if minutes
+                        else " (the background sync is not installed: run `claude-accounts sync`)")
+                lines.append("  auto-restart - on, the next sync arms it for %s%s" % (
+                    f["account"], hint))
         return lines
     except Exception:
         return []
@@ -1969,20 +2009,28 @@ def cmd_auto_restart(cfg, args):
         if why_not:
             print("Nothing was armed just now: %s." % why_not)
         print("\n".join(restart_status_lines(cfg)))   # what waits where now, and what does not and why
-        print("A task named \"%s\" waits in the task list of every account the app is not "
+        # The copying of scheduled tasks is what arms the task: with it off, none waits.
+        print("%s named \"%s\" waits in the task list of every account the app is not "
               "signed in to and that has a current usage reading with usage left. The readings "
               "come from `claude-accounts usage` (its watcher keeps them current: claude-accounts "
               "watch install); without one for an account, nothing is armed there. The task starts "
               "when the app signs in there and restarts the newest %s the sign-out cut off. It "
               "runs in the permission mode that task has in the app (or your default mode): in a "
               "mode that asks before a step, the run waits for you." % (
+                  "A task" if tasks_on(cfg) else
+                  "Once copying scheduled tasks is turned on again, a task",
                   PICKUP_NAME, plural(restart_max(cfg), "chat")))
         return 0
     waiting = armed_pickups(cfg)
     if waiting:
-        print("The pick-up task on %s is still switched on (%s). A sync switches it off. If it "
-              "starts before that, it restarts nothing." % (
-                  ", ".join(waiting), why_not or "its task list was not changed"))
+        # A sync leaves every task list alone while the task copying is off: then only
+        # this command reaches the task.
+        how = ("A sync switches it off." if tasks_on(cfg) else
+               "Run this command again to switch it off: a sync does not, while copying "
+               "scheduled tasks is turned off.")
+        print("The pick-up task on %s is still switched on: %s. %s If it starts before that, it "
+              "restarts nothing." % (
+                  ", ".join(waiting), why_not or "its task list was not changed", how))
     else:
         print("No pick-up task is waiting now. Chats cut off by a switch wait until someone tells "
               "them to continue (claude-accounts sync handover).")

@@ -1614,8 +1614,8 @@ class PaidExtraUsageLastTest(Base):
 
 
 class PaidRunsUseOpusTest(Base):
-    """The rule: a run that lands on paid extra usage uses Opus. Max effort and
-    ultracode are not set here: the shared settings.json turns them on for every run."""
+    """The rule: a run that lands on paid extra usage uses Opus. Effort is not
+    changed here."""
 
     def setUp(self):
         super().setUp()

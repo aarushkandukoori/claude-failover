@@ -288,6 +288,23 @@ class MemoryTest(unittest.TestCase):
                "confirmed": []}
         self.assertEqual(db.resolve(mem, ["y"], False, False)[1], ["x"])
 
+    def test_the_hash_of_a_write_is_kept_until_the_app_saves_the_list(self):
+        # The memory of a list keeps the hash of this tool's last write, so that the
+        # file is still known as this tool's when the note in tasks-written.json is lost.
+        mem = db.after_write(db.memory(["own"]), ["own", "x"], ["x"], self.T0, False, "abc")
+        self.assertEqual(mem, {"held": ["own"], "pending": {"x": self.T0}, "confirmed": [],
+                               "wrote": "abc"})
+        self.assertEqual(db.memory(mem), mem)                       # as read back from the state file
+        for odd in (5, "", None, ["abc"]):
+            self.assertEqual(db.memory(dict(mem, wrote=odd)),
+                             {"held": ["own"], "pending": {"x": self.T0}, "confirmed": []})
+        # A look that finds the file untouched keeps it, whoever is signed in.
+        self.assertEqual(db.resolve(mem, ["own", "x"], True, False)[0]["wrote"], "abc")
+        self.assertEqual(db.resolve(mem, ["own", "x"], True, True)[0]["wrote"], "abc")
+        # A save by the app ends it, and so does a write whose hash is not given.
+        self.assertNotIn("wrote", db.resolve(mem, ["own", "x"], False, False)[0])
+        self.assertNotIn("wrote", db.after_write(mem, ["own", "x"], [], self.T0 + 5, False))
+
 
 if __name__ == "__main__":
     unittest.main()

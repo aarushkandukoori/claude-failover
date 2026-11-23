@@ -1450,9 +1450,8 @@ def paid_model_argv(cfg, name, argv):
     usage, Opus). Then --model is set to the paid model, where the caller's stood.
     A run that is on Opus already is left alone. So is every run when the account is
     out of the paid model itself (a model-only limit): then the caller's model is the
-    only one that can run there. Effort and ultracode are not touched here (the
-    shared settings.json sets them for every run). Never raises: on any doubt, argv
-    comes back as it was."""
+    only one that can run there. Effort is not touched here. Never raises: on any
+    doubt, argv comes back as it was."""
     try:
         model = paid_model(cfg)
         if not model or not bills_extra_usage(cfg, name):
@@ -1858,7 +1857,7 @@ def effective_real_claude():
 
 
 def memguard_gate(argv):
-    """Headless runs (-p/--print, like the 5 AM jobs) wait while memguard says memory is in
+    """Headless runs (-p/--print) wait while memguard says memory is in
     danger (up to 30 min), so background work never piles onto a nearly full Mac."""
     if "-p" not in argv and "--print" not in argv:
         return

@@ -235,6 +235,17 @@ The rules. All of them are in `desktop_backlog.py`.
      about an app that documents none of this, not proof. It errs on the side of keeping:
      an item kept by mistake comes back once after a switch, while an item removed by
      mistake would be gone from both accounts (a copy stays in the backups).
+
+     Sync keeps the moment in which this can go wrong short. It does not write into a
+     list once the app has switched accounts during the run (it asks again right before
+     the write), and it knows its own write by a hash that is kept in two places. What
+     that run would have removed from the list stays there, so a card that was started
+     or dropped just before the switch can come back once. Two
+     cases are left, and both rest on how the app behaves, which is not known for sure.
+     The app could file one of the just-written cards itself (from the same chat) before
+     it has read the write, which then looks as if it had read the write. Or the app
+     could save an account's list after it has already signed in to another account. In
+     both, a card could leave the other account although nobody started it.
    - **An item pushed out of a full folder.** While a folder holds 20 items, or the list
      100, the app drops the oldest by itself. An item that left such a folder is not
      taken off the other list.
@@ -312,7 +323,9 @@ signed in to the other account: the newest 3, and only when that account has a c
 usage reading with usage left. The readings come from `account_switch.py`
 (`claude-accounts usage`; its watcher, `claude-accounts watch install`, keeps them
 current, see [SWITCHING.md](SWITCHING.md)). Without a reading nothing is armed and
-nothing is restarted, and `claude-accounts sync auto-restart` says so.
+nothing is restarted, and `claude-accounts sync auto-restart` says so. The copying of
+scheduled tasks has to be on as well (it is by default): that step is what arms the
+task, so with `"scheduled_tasks": false` nothing is armed.
 
 Nothing outside the app can type into a chat, so the restart comes from inside it,
 through the app's own scheduled tasks:
@@ -341,7 +354,9 @@ What `sync restart` hands out, and what it never does:
 - **A few at a time.** One run hands out the newest 3 (`"desktop_sync": {"restart_max":
   N}` changes that). Every restarted chat is a heavy turn on the new account, and a dozen
   at once is how a week of usage, or the Mac's memory, is used up. The others are listed
-  with the reason and wait for you.
+  with the reason, for you to continue by hand. The limit is per run: a later run within
+  the 6 hours (the task started again with Run now, `sync restart` by hand, the pick-up
+  at the next switch) hands out the next ones that are still cut off.
 - **Never a chat twice.** A claim stands for 15 minutes or until the chat moves on, so a
   second run, or another helper that reads `sync handover`, sees "restart sent". A claim
   made while the app was signed in to another account does not hold: that run died with
@@ -390,7 +405,12 @@ What to know before turning it on:
   command is a switch and nothing else: it copies no chats, no other tasks and no
   backlogs, also when the background sync is not installed. When it cannot get at a task
   list at that moment (another sync is running, or the app's account cannot be told), it
-  says so and a later sync does it; a task that starts in between restarts nothing. The
+  says so and a later sync does it; a task that starts in between restarts nothing. With
+  `"scheduled_tasks": false` a sync leaves every task list alone, so then only running
+  `sync auto-restart off` again switches a waiting task off, and the command and
+  `sync status` say that. A task that was armed before the copying was turned off keeps
+  waiting and still starts at the next sign-in there while auto-restart is on; `sync
+  status` shows it. The
   task is never deleted by sync; delete it in the app if you want it gone.
 
 ## A sync at sign-out
@@ -479,7 +499,8 @@ transcript, which `claude --resume` lists.
   are the same chats, so leaving them is harmless.
 - **Stop copying scheduled tasks** - set `"desktop_sync": {"scheduled_tasks": false}` in
   the config. The chat sync goes on. Tasks already copied stay in the other accounts'
-  lists.
+  lists, and so does a pick-up task that is already armed (`claude-accounts sync
+  auto-restart off` switches it off, see "Stop the automatic restarts" below).
 - **Stop copying the task backlog** - set `"desktop_sync": {"backlog": false}`. Its
   backups are next to the task-list backups, named `backlog.<date>-<time>.json`, and go
   back the same way, over `backlog/tasks.json` in the account's folder.
@@ -489,7 +510,7 @@ transcript, which `claude --resume` lists.
   uninstall` removes the job, and with it the sync on its interval.
 - **Put a task list back** - every list sync replaced has copies in
   `desktop-sync/task-backups/<account id>/<organization id>/` in the state folder, named
-  `scheduled-tasks.<date>-<time>.json`. Turn the copying off first (the line above), or
+  `scheduled-tasks.<date>-<time>.json`. Turn the copying off first ("Stop copying scheduled tasks" above), or
   the next sync writes the signed-in account's tasks into the list again. Then, while the
   app is signed in to another account or closed, copy the backup over
   `scheduled-tasks.json` in that account's folder under `claude-code-sessions`. The app

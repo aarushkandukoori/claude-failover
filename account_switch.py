@@ -17,9 +17,11 @@ that. It never opens a window or signs the app out by itself (unless the config 
                            on the account the app is not using (with switch.auto_order
                            on), and finishes a switch of the app it notices
 
-Nothing here signs anything in or out, reads a token, or changes a file of the desktop
-app. The usage numbers come from one tiny call per account (the call `claude-accounts
-test` makes): Claude Code reports the account's limits with every answer.
+Nothing here signs anything in or out or reads a token. The desktop app's files are
+changed only by the desktop sync that `switch` and the watcher run: chat records,
+scheduled tasks and task backlogs (docs/DESKTOP-SYNC.md). The usage numbers come from
+one tiny call per account (the call `claude-accounts test` makes): Claude Code reports
+the account's limits with every answer.
 
 The design is in docs/SWITCHING.md.
 """

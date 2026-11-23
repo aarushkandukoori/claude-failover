@@ -44,6 +44,9 @@ failed). Nothing is dropped, and the order in `config.json` is not rewritten.
 `claude-accounts status` shows the order that is really used. "Full" means the account
 cannot run right now: its week is used up, or a shorter limit is holding it.
 
+Both rules hold for as long as the last reading says so, also after the watcher is
+uninstalled. How to end them: [Turning it off](#turning-it-off).
+
 **Every run that does land on the account that bills uses Opus.** When the account
 bills (or may start to), the wrapper sets `--model opus` on a background job, a chat
 started in Terminal and a chat the hook hands to Terminal, whatever model it would
@@ -51,8 +54,7 @@ have used: the default of `settings.json`, or one the caller named, Sonnet and H
 included. The caller's `--model` is replaced where it stands. Only a run that is on
 Opus already is left alone, and so is every run while the account is out of Opus
 itself. `"extra_usage_model"` in `config.json` names another model, and `false` turns
-this off. Effort and ultracode are not set here: the shared `settings.json` turns max
-effort and ultracode on for every run. Chats and scheduled tasks inside the desktop
+this off. Effort is not changed here. Chats and scheduled tasks inside the desktop
 app do not go through the wrapper, so their model is whatever the app uses.
 
 Where it is not kept, because the work is already running or goes around the wrapper:
@@ -314,3 +316,20 @@ claude-accounts watch uninstall     # stop the watcher; the hook stops starting 
 Set `"auto_order": false` to keep the account order as you wrote it. The order the
 watcher last wrote stays in the config: change `order.headless` and `order.interactive`
 by hand, or copy a file back from `switch/config-backups/`.
+
+Neither of these ends the two rules of
+[Paid extra usage comes last](#paid-extra-usage-comes-last). Both rules go by the last
+usage reading in `switch.json`. Only the watcher, `claude-accounts usage` and
+`claude-accounts switch` renew it, so without the watcher it gets old. After 4 hours, or
+as soon as the window it was taken in has reset, it counts as not known, and an account
+that had extra usage turned on then counts as one that may bill: it is tried last, and
+every run that lands on it uses Opus, until you end that.
+
+- `"extra_usage_model": false` in `config.json` turns the Opus rule off. That is the
+  way to end that rule alone.
+- Deleting `switch.json` from the state folder ends both rules: an account that was
+  never read is not taken for one that bills. The file also holds which warnings were
+  shown and which account is out until its reset, and that is forgotten with it. The
+  next `claude-accounts usage` or `claude-accounts switch` then reads every account
+  again with one call each, and for an account that is out with extra usage turned on
+  that call is billed. From then on both rules go by the new readings.
