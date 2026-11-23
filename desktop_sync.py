@@ -80,7 +80,10 @@ RESTARTS_FILE = "restarts.json"     # which chats were claimed for a restart, an
 EVENTS_TAIL_BYTES = 4 * 1024 * 1024  # how much of the event log is read to find Terminal handoffs
 PICKUP_ID = "pick-up-after-account-switch"     # the scheduled task that restarts cut-off chats
 PICKUP_NAME = "Pick up after an account switch"
-OUT_OF_USAGE_AT = 0.97         # a week this much used counts as used up
+OUT_OF_USAGE_AT = 0.97         # usage this far gone counts as used up
+RESTART_MAX = 3                # chats one `sync restart` hands out at most
+USAGE_EXTRA_MAX_MINUTES = 90   # with paid extra usage on, a usage reading older than this decides nothing
+GATE_SECONDS = 60              # how long the restart gate command may take
 TAIL_BYTES = 512 * 1024        # how much of a transcript's end is read first
 TAIL_MAX_BYTES = 32 * 1024 * 1024
 PS_RE = re.compile(r"^\s*(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)\s+(.*)$")   # [[days-]hours:]minutes:seconds command
@@ -113,7 +116,7 @@ COUNTS = ("added", "added_needs_restart", "updated", "retired", "stale_in_runnin
 USAGE = """usage: claude-accounts sync [--dry-run] [--quiet] [--json]
        claude-accounts sync install [--every MINUTES] | sync uninstall | sync status
        claude-accounts sync handover [--json] [--hours N]
-       claude-accounts sync restart [--json] [--dry-run]
+       claude-accounts sync restart [--json] [--dry-run] [--by-hand]
        claude-accounts sync auto-restart [on|off]
 
   sync              copy desktop app chats so every account lists every chat, and
@@ -799,22 +802,24 @@ def _mirror_into(cfg, tasks, dst, now_ms, sdir, dry_run, errors):
     their_pick = next((t for t in theirs if t["id"] == PICKUP_ID), None)
     on = auto_restart_on(cfg)
     if on or their_pick is not None:
-        out_until = out_of_usage(dst["account"]) if on else None
+        # Armed only where the account is known to have usage left: not knowing counts as no.
+        usable, why_not = usage_verdict(cfg, dst["account"], strict=False) if on else (
+            False, "auto-restart is off")
         entry, action = desktop_tasks.pickup_plan(mine_pick, their_pick, pickup_base(cfg),
-                                                  on and not out_until, now_ms)
+                                                  on and usable, now_ms)
         if entry is not None:
             new_list.append(entry)
         if action:
-            when = ("when the app signs in to %s" % dst["account"] if action == "arm"
-                    else "auto-restart is off" if not on
-                    else "%s is out of usage until %s" % (dst["account"], out_until))
-            row["changes"].append({"action": action, "id": PICKUP_ID,
-                                   "name": desktop_tasks.label(entry), "schedule": when,
-                                   "fields": []})
+            row["changes"].append({
+                "action": action, "id": PICKUP_ID, "name": desktop_tasks.label(entry),
+                "schedule": why_not if action == "disarm" else "when the app signs in to %s" % (
+                    dst["account"]),
+                "fields": desktop_tasks.changed_fields(their_pick, entry) if action == "update"
+                else []})
     if not row["changes"] or dry_run:
         return row
     try:
-        if any(c["action"] == "arm" for c in row["changes"]):
+        if any(c["action"] == "arm" and c["id"] == PICKUP_ID for c in row["changes"]):
             ensure_pickup_prompt(cfg)   # a task without its prompt file cannot start
         data = desktop_tasks.encode(dict(doc, scheduledTasks=new_list))
         if desktop_tasks.parse(data)["scheduledTasks"] != new_list:
@@ -972,18 +977,11 @@ def backlog_count(folder_path):
     return len(read_backlog(folder_path)[0]["items"])
 
 
-def held_keys(folder, raw, items, seen, ours):
-    """The items of an account's backlog that the app itself is known to hold, as
-    keys. A file that is still byte for byte what this tool wrote proves nothing:
-    the app may not have read that write, and may save an older copy of the list
-    over it, or drop items to make room. So until the app has saved the file
-    itself, only what was held before and is still there counts. `seen` is
-    backlog-seen.json, `ours` the hashes of this tool's last writes."""
-    now = desktop_backlog.keys(items)
-    if raw is not None and ours.get(written_key(folder, "backlog")) == hashlib.sha256(raw).hexdigest():
-        before = seen.get(task_key(folder))
-        return sorted(set(before if isinstance(before, list) else []) & set(now))
-    return now
+def still_ours(folder, raw, ours):
+    """True if an account's backlog file is byte for byte what this tool wrote
+    last: the app has not saved it since. `ours` = the hashes of the last writes."""
+    return (raw is not None
+            and ours.get(written_key(folder, "backlog")) == hashlib.sha256(raw).hexdigest())
 
 
 def mirror_backlog(cfg, folders, active, sdir, dry_run, errors):
@@ -1016,13 +1014,15 @@ def mirror_backlog(cfg, folders, active, sdir, dry_run, errors):
     seen = seen if isinstance(seen, dict) else {}
     ours = cf.read_json(state.parent / TASKS_WRITTEN_FILE, {})
     ours = ours if isinstance(ours, dict) else {}
-    before = seen.get(task_key(src))
-    before = before if isinstance(before, list) else None
-    now_ms = time.time() * 1000
+    now = time.time()
+    # What left the signed-in account's list since it was last looked at.
+    src_memory, gone = desktop_backlog.resolve(
+        desktop_backlog.memory(seen.get(task_key(src))), desktop_backlog.keys(doc["items"]),
+        still_ours(src, raw, ours), now)
     after, settled = {}, True
     for dst in folders:
         if dst is not src:
-            row, left = _backlog_into(cfg, doc["items"], before, dst, now_ms, sdir, dry_run, errors,
+            row, left = _backlog_into(cfg, doc["items"], gone, dst, now, sdir, dry_run, errors,
                                       seen, ours)
             out["targets"].append(row)
             if left is not None:
@@ -1032,7 +1032,7 @@ def mirror_backlog(cfg, folders, active, sdir, dry_run, errors):
     if settled:
         # Only now forget what this list held before: an item that left it must be
         # taken off every other list first, or it would stay there for good.
-        after[task_key(src)] = held_keys(src, raw, doc["items"], seen, ours)
+        after[task_key(src)] = src_memory
     if not dry_run and any(seen.get(k) != v for k, v in after.items()):
         try:
             cf.atomic_write_json(state, dict(seen, **after))
@@ -1041,9 +1041,10 @@ def mirror_backlog(cfg, folders, active, sdir, dry_run, errors):
     return out
 
 
-def _backlog_into(cfg, items, before, dst, now_ms, sdir, dry_run, errors, seen, ours):
-    """One other account: (its row of the report, the keys its list is known to
-    hold after this run (see held_keys), or None when the list could not be read)."""
+def _backlog_into(cfg, items, gone, dst, now, sdir, dry_run, errors, seen, ours):
+    """One other account: (its row of the report, what is remembered about its
+    list from here on (desktop_backlog.memory), or None when the list could not
+    be read). `gone` = the keys that left the signed-in account's list."""
     row = {"account": dst["account"], "added": [], "removed": [], "skipped": [], "only_there": 0,
            "written": False, "backup": None, "note": None}
     if tasks_in_another_org(cfg, dst, backlog_count):
@@ -1055,10 +1056,14 @@ def _backlog_into(cfg, items, before, dst, now_ms, sdir, dry_run, errors, seen, 
         row["note"] = "its backlog cannot be read (%s)" % why(e)
         return row, None
     new_list, row["added"], row["removed"], row["only_there"], row["skipped"] = \
-        desktop_backlog.plan(items, doc["items"], before, now_ms)
-    old_keys = held_keys(dst, raw, doc["items"], seen, ours)
+        desktop_backlog.plan(items, doc["items"], gone, now * 1000)
+    # Its own memory: if the app saved this list while it was signed in there, what
+    # it holds is known again. What left it meanwhile is not followed up here.
+    old_keys = desktop_backlog.keys(doc["items"])
+    remembered, _left = desktop_backlog.resolve(
+        desktop_backlog.memory(seen.get(task_key(dst))), old_keys, still_ours(dst, raw, ours), now)
     if not (row["added"] or row["removed"]) or dry_run:
-        return row, old_keys
+        return row, remembered
     folder = dst["path"] / BACKLOG_DIR
     try:
         data = desktop_backlog.encode(dict(doc, items=new_list))
@@ -1075,17 +1080,18 @@ def _backlog_into(cfg, items, before, dst, now_ms, sdir, dry_run, errors, seen, 
                    mode=stat.S_IMODE(st.st_mode) if st is not None else None)
     except Changed:
         row["note"] = "its backlog changed during the sync (the next run catches up)"
-        return row, old_keys
+        return row, remembered
     except (OSError, ValueError, desktop_backlog.NotABacklog) as e:
         errors.append("could not update the task backlog of %s: %s" % (dst["account"], why(e)))
-        return row, old_keys
+        return row, remembered
     row["written"] = True
     try:
         remember_tasks_write(sdir, dst, data, "backlog")
     except (OSError, TypeError, ValueError):
         pass   # the next run then makes one backup more than needed
-    # What was added counts as held there only once the app has saved that list itself.
-    return row, sorted(set(old_keys) & set(desktop_backlog.keys(new_list)))
+    # What was added is pending there until the app is seen to have taken it over.
+    new_keys = desktop_backlog.keys(new_list)
+    return row, desktop_backlog.after_write(remembered, new_keys, set(new_keys) - set(old_keys), now)
 
 
 def backlog_lines(r):
@@ -1115,8 +1121,8 @@ def backlog_lines(r):
             lines.extend("    add - %s" % one_line(t, 100) for t in row["added"])
             lines.extend("    remove - %s (started or dropped on %s)" % (one_line(t, 100), b["source"])
                          for t in row["removed"])
-            lines.extend("    not copied - %s (its folder or the whole list is full: the app keeps %d "
-                         "items per folder and %d in all)" % (
+            lines.extend("    not copied - %s (its folder or the whole list is nearly full: the app "
+                         "keeps %d items per folder and %d in all)" % (
                              one_line(t, 100), desktop_backlog.FOLDER_CAP, desktop_backlog.TOTAL_CAP)
                          for t in row["skipped"])
         if row["note"]:
@@ -1273,7 +1279,7 @@ def handover(cfg, hours=HANDOVER_HOURS):
     oldest = now - hours * 3600
     out = {"hours": hours, "note": None, "chats": []}
     newest = recent_records(cfg, oldest)
-    claims = read_claims()
+    claims, account = read_claims(), signed_in_account(cfg)
     running = running_chats()
     if running is None:
         out["note"] = "could not check which chats are still running, so none is listed as cut off"
@@ -1284,7 +1290,7 @@ def handover(cfg, hours=HANDOVER_HOURS):
         if chat is not None:
             claim = claims.get(chat["session"])
             sent = (chat["state"] == "cut_off"
-                    and desktop_handover.claim_is_live(claim, chat["at"], now))
+                    and desktop_handover.claim_is_live(claim, chat["at"], now, account))
             chat["restart_sent"] = claim.get("claimed") if sent else None
             found.append(chat)
     found.sort(key=lambda c: (c["state"] == "waiting", -c["_when"]))
@@ -1345,6 +1351,10 @@ def _handover_chat(sid, record, paths, running, oldest, now):
         return None
     state, detail, why_failed = None, tail["detail"], None
     at = cf.parse_iso(tail["at"]) or dt.datetime.fromtimestamp(st.st_mtime, cf.LOCAL_TZ)
+    if at.timestamp() < oldest:
+        # The file changed lately (opening a chat is enough), but the chat stopped
+        # before the time asked about: that is not recent work.
+        return None
     born = getattr(st, "st_birthtime", None)
     alive = running is not None and desktop_handover.is_alive(cli_id, born, running)
     if tail["state"] == desktop_handover.CUT_OFF:
@@ -1487,7 +1497,7 @@ You are the automatic pick-up after an account switch. The Claude desktop app wa
 
    %(script)s sync restart --json
 
-   "chats" are the chats to restart. "skipped" are the ones it left alone, each with the reason. The command has already made sure no chat is restarted twice: every chat in "chats" is now claimed for this run. Never restart a chat that is not in "chats", and do not run the command a second time to get more.
+   "chats" are the chats to restart: a few at most, on purpose. "skipped" are the ones it left alone, each with the reason. The command has already made sure no chat is restarted twice: every chat in "chats" is now claimed for this run. Never restart a chat that is not in "chats", and do not run the command a second time to get more.
 
 2. If "chats" is empty, say so in one line, add the "note" if there is one, and stop.
 
@@ -1506,21 +1516,80 @@ def auto_restart_on(cfg):
     return settings(cfg).get("auto_restart") is True
 
 
-def out_of_usage(account):
-    """When the account has used up its week: the time that week starts again, as
-    text. None when it has usage left or nothing is known. This tool reads no
-    usage itself: the readings come from an optional module named account_switch
-    (a switch helper that is not part of this repository), when one is there."""
+def signed_in_account(cfg):
+    """The config name of the account the app is signed in to, or None when that
+    cannot be told (no such account in the config, or two folders for it)."""
+    ddir = desktop_dir(cfg)
+    folders, _skipped = resolve_folders(cfg, ddir)
+    active = active_account_uuid(ddir)
+    mine = [f["account"] for f in folders if same_id(f["account_uuid"], active)]
+    return mine[0] if len(mine) == 1 else None
+
+
+def usage_verdict(cfg, account, strict=True):
+    """(True, None) when the account is known to have usage left, else (False, why).
+    Not knowing counts as no: a chat restarted on an account that is out of usage
+    stops again at once, or, with paid extra usage turned on, runs up a bill.
+
+    This tool reads no usage itself. The readings come from an optional module
+    named account_switch (a switch helper that is not part of this repository):
+    its snapshot() says per account whether it is out, how much room its fullest
+    window has left, and whether paid extra usage is on. Without that module
+    nothing counts as known. `strict` (for the moment chats are restarted) also
+    wants a recent reading when extra usage is on."""
+    if not account:
+        return False, "cannot tell which account the app is signed in to"
     try:
         import account_switch
-        reading = account_switch.read_state()["usage"].get(account)
-        used, resets = reading.get("week_util"), cf.parse_iso(reading.get("week_resets_at"))
-    except Exception:   # no switch helper, no reading yet, or readings in another shape
+        acct = account_switch.snapshot(cfg, extension={})["accounts"].get(account)
+    except Exception:   # no such module, or it failed: nothing is known
+        return False, "there are no usage readings (they come from a switch helper)"
+    if not isinstance(acct, dict):
+        return False, "there is no usage reading for %s" % account
+    if acct.get("out") or acct.get("spent"):
+        back = next((acct.get(k) for k in ("back", "week_resets", "resets")
+                     if isinstance(acct.get(k), dt.datetime)), None)
+        return False, "%s is out of usage%s" % (
+            account, " until %s" % clock(cf.iso(back)) if back else "")
+    room, read_at = acct.get("room"), acct.get("read_at")
+    known = isinstance(room, (int, float)) and not isinstance(room, bool)
+    if not known or not isinstance(read_at, dt.datetime):
+        return False, "there is no current usage reading for %s" % account
+    if acct.get("extra_in_use"):
+        return False, "%s is running on paid extra usage" % account
+    week = acct.get("week_room")
+    if room <= 1 - OUT_OF_USAGE_AT or (isinstance(week, (int, float)) and week <= 1 - OUT_OF_USAGE_AT):
+        return False, "%s has almost no usage left" % account
+    age = (cf.now_local() - read_at).total_seconds() / 60.0
+    if strict and acct.get("extra") and not 0 <= age <= USAGE_EXTRA_MAX_MINUTES:
+        return False, ("the last usage reading for %s is %d minutes old, and it has paid extra "
+                       "usage turned on" % (account, age))
+    return True, None
+
+
+def gate_says_no(cfg):
+    """Why the restart gate refuses, or None. The gate is an optional command,
+    "desktop_sync": {"restart_gate": "..."}: it is run through /bin/sh before any
+    chat is handed out, and anything but exit code 0 means not now (too little
+    memory free, say)."""
+    gate = settings(cfg).get("restart_gate")
+    if not isinstance(gate, str) or not gate.strip():
         return None
-    if (isinstance(used, (int, float)) and not isinstance(used, bool) and used >= OUT_OF_USAGE_AT
-            and resets is not None and resets > cf.now_local()):
-        return clock(cf.iso(resets))
-    return None
+    try:
+        done = subprocess.run(["/bin/sh", "-c", gate], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              timeout=GATE_SECONDS)
+    except (OSError, subprocess.SubprocessError) as e:
+        return "the restart gate command could not be run (%s)" % why(e)
+    return None if done.returncode == 0 else (
+        "the restart gate command says not now (exit code %d)" % done.returncode)
+
+
+def restart_max(cfg):
+    """How many chats one run restarts at most: "desktop_sync": {"restart_max": N},
+    RESTART_MAX when not set."""
+    n = settings(cfg).get("restart_max")
+    return n if isinstance(n, int) and not isinstance(n, bool) and 1 <= n <= 20 else RESTART_MAX
 
 
 def pickup_prompt_path(cfg):
@@ -1575,26 +1644,29 @@ def terminal_handoffs():
     return found
 
 
-def restart_claims(cfg, dry_run=False):
+def restart_claims(cfg, dry_run=False, by_hand=False):
     """Claim the chats that should be restarted now, each one once, and return
     {"account", "chats": [{"session", "title", "cut_at", "detail", "message"}],
      "skipped": [{"session", "title", "why"}], "note"}.
 
     Only a chat that a sign-out (or a crash) cut off in the middle of a turn in
-    the last RESTART_HOURS is restarted. Never one whose turn ended at a usage
-    limit (the hook hands those to Terminal), one that was handed to Terminal or
-    forked since, a scheduled run, one that is being restarted already, or one
-    that waits for the person. A dry run claims nothing."""
-    out = {"account": None, "chats": [], "skipped": [], "note": None}
-    ddir = desktop_dir(cfg)
-    folders, _skipped = resolve_folders(cfg, ddir)
-    active = active_account_uuid(ddir)
-    mine = [f["account"] for f in folders if same_id(f["account_uuid"], active)]
-    out["account"] = mine[0] if len(mine) == 1 else None
-    until = out_of_usage(out["account"]) if out["account"] else None
-    if until:
-        out["note"] = ("the app is signed in to %s, which is out of usage until %s, so nothing is "
-                       "restarted" % (out["account"], until))
+    the last RESTART_HOURS is restarted, the newest restart_max(cfg) of them.
+    Never one whose turn ended at a usage limit (the hook hands those to
+    Terminal), one that was handed to Terminal or forked since, a scheduled run,
+    one that is being restarted already, or one that waits for the person.
+
+    Nothing at all is handed out when auto-restart is off (unless `by_hand`: a
+    person asked), when the signed-in account cannot be named or is not known to
+    have usage left, or when the gate command says no. A dry run claims nothing."""
+    out = {"account": signed_in_account(cfg), "chats": [], "skipped": [], "note": None}
+    stop = None
+    if not by_hand and not auto_restart_on(cfg):
+        stop = "auto-restart is off"
+    else:
+        usable, why_not = usage_verdict(cfg, out["account"])
+        stop = why_not if not usable else gate_says_no(cfg)
+    if stop:
+        out["note"] = "%s, so nothing is restarted" % stop
         return out
     if dry_run:
         return _restart_claims(cfg, out, None)
@@ -1620,8 +1692,8 @@ def _restart_claims(cfg, out, sdir):
         parent, made = record.get("forkedFromSessionId"), record.get("createdAt")
         if isinstance(parent, str) and isinstance(made, (int, float)) and not isinstance(made, bool):
             forks[parent] = max(forks.get(parent, 0), made)
-    claims, now = read_claims(), time.time()
-    for c in first["chats"]:
+    claims, now, limit = read_claims(), time.time(), restart_max(cfg)
+    for c in first["chats"]:   # newest first
         if c["state"] == "waiting":
             continue   # it needs an answer from the person, not a push
         cut = cf.parse_iso(c["at"])
@@ -1636,14 +1708,21 @@ def _restart_claims(cfg, out, sdir):
             why_not = "a restart was sent at %s" % clock(c["restart_sent"])
         elif still.get(c["session"]) != c["at"]:
             why_not = "it moved on while this ran"
-        elif handed is not None and cut is not None and handed >= cut - dt.timedelta(minutes=5):
+        elif cut is None or now - cut.timestamp() > RESTART_HOURS * 3600:
+            why_not = "it was cut off more than %s ago" % plural(RESTART_HOURS, "hour")
+        elif handed is not None and handed >= cut - dt.timedelta(minutes=5):
             why_not = "it was handed to Terminal at %s" % clock(cf.iso(handed))
-        elif cut is not None and forks.get(c["session"], 0) > cut.timestamp() * 1000:
+        elif forks.get(c["session"], 0) > cut.timestamp() * 1000:
             why_not = "a fork of it carried on"
+        elif len(out["chats"]) >= limit:
+            # Every restarted chat is a heavy turn on the new account. More than a few
+            # at once is how a week of usage, or the Mac's memory, is used up.
+            why_not = "more than %s to restart at once: continue it by hand" % plural(limit, "chat")
         if why_not:
             out["skipped"].append({"session": c["session"], "title": c["title"], "why": why_not})
             continue
-        claims[c["session"]] = {"cut_at": c["at"], "claimed_at": now, "claimed": cf.iso(cf.now_local())}
+        claims[c["session"]] = {"cut_at": c["at"], "claimed_at": now, "account": out["account"],
+                                "claimed": cf.iso(cf.now_local())}
         out["chats"].append({"session": c["session"], "title": c["title"], "cut_at": c["at"],
                              "detail": c["detail"],
                              "message": desktop_handover.restart_message(clock(c["at"]), c["detail"])})
@@ -1658,12 +1737,12 @@ def _restart_claims(cfg, out, sdir):
 
 
 def cmd_restart(cfg, args):
-    if any(a not in ("--json", "--dry-run") for a in args):
+    if any(a not in ("--json", "--dry-run", "--by-hand") for a in args):
         print(USAGE)
         return 2
     dry = "--dry-run" in args
     try:
-        r = restart_claims(cfg, dry_run=dry)
+        r = restart_claims(cfg, dry_run=dry, by_hand="--by-hand" in args)
     except (OSError, TypeError, ValueError) as e:
         print("Could not claim the chats to restart: %s" % why(e))
         return 1
@@ -1710,13 +1789,12 @@ def restart_status_lines(cfg):
             except (Unsafe, desktop_tasks.NotATaskList, OSError):
                 continue
             pick = next((t for t in tasks if t["id"] == PICKUP_ID), None)
-            until = out_of_usage(f["account"])
+            usable, why_not = usage_verdict(cfg, f["account"], strict=False)
             if pick is not None and desktop_tasks.is_armed(pick, time.time() * 1000):
                 lines.append("  auto-restart - on: chats cut off by a switch restart by themselves "
                              "when the app signs in to %s" % f["account"])
-            elif until:
-                lines.append("  auto-restart - on, but not armed for %s: it is out of usage until %s"
-                             % (f["account"], until))
+            elif not usable:
+                lines.append("  auto-restart - on, but not armed for %s: %s" % (f["account"], why_not))
             else:
                 lines.append("  auto-restart - on, the next sync arms it for %s" % f["account"])
         return lines
@@ -1731,20 +1809,32 @@ def cmd_auto_restart(cfg, args):
     if args:
         on = args == ["on"]
         print(set_setting(cfg, "auto_restart", on))
+        # Act on it now, not at the next background sync: a pick-up task that is
+        # still armed after "off" would start at the next sign-in.
+        block = cfg.get("desktop_sync") if isinstance(cfg.get("desktop_sync"), dict) else {}
+        cfg["desktop_sync"] = dict(block, auto_restart=on)
+        report = sync(cfg)
+        for line in task_lines(report) if "folders" in report else []:
+            if PICKUP_NAME in line:
+                print(line.strip())
+        for e in report.get("errors") or []:
+            print("error - %s" % e)
         if on:
             try:
                 print("The pick-up task's instructions: %s" % tilde(ensure_pickup_prompt(cfg)))
             except OSError as e:
                 print("Could not write the pick-up task's instructions: %s" % why(e))
                 return 1
-            print("From the next sync on, a task named \"%s\" waits in the task list of every "
-                  "account the app is not signed in to. It starts when the app signs in there and "
-                  "restarts the chats the sign-out cut off. It runs in the permission mode that "
-                  "task has in the app (or your default mode): in a mode that asks before a step, "
-                  "the run waits for you." % PICKUP_NAME)
+            print("A task named \"%s\" waits in the task list of every account the app is not "
+                  "signed in to and that is known to have usage left. It starts when the app signs "
+                  "in there and restarts the newest %s the sign-out cut off. It runs in the "
+                  "permission mode that task has in the app (or your default mode): in a mode that "
+                  "asks before a step, the run waits for you." % (
+                      PICKUP_NAME, plural(restart_max(cfg), "chat")))
         else:
-            print("The next sync switches the waiting pick-up task off. Chats cut off by a switch "
-                  "then wait until someone tells them to continue (claude-accounts sync handover).")
+            print("A waiting pick-up task is switched off, and one that starts anyway restarts "
+                  "nothing. Chats cut off by a switch wait until someone tells them to continue "
+                  "(claude-accounts sync handover).")
         return 0
     print("\n".join(["Restarting chats after a switch"] + restart_status_lines(cfg)))
     return 0

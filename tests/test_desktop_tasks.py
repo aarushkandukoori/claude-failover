@@ -333,6 +333,11 @@ class PickupTest(unittest.TestCase):
         self.assertEqual(entry, dict(self.BASE, createdAt=NOW, fireAt=NOW - 1000, enabled=True))
         self.assertTrue(dt.is_armed(entry, NOW))
         self.assertEqual(self.plan(None, entry), (entry, None))      # and then it is left alone
+        # An armed copy still takes over what the app stores for the task here later.
+        mine = dict(self.BASE, enabled=True, createdAt=7, permissionMode="auto", lastRunAt="x")
+        fresh, action = self.plan(mine, entry)
+        self.assertEqual((action, fresh), ("update", dict(entry, permissionMode="auto")))
+        self.assertEqual(self.plan(mine, fresh), (fresh, None))
 
     def test_after_it_ran_it_is_armed_again(self):
         fired = ran(dict(self.BASE, createdAt=NOW - 5 * HOUR, fireAt=NOW - 5 * HOUR,

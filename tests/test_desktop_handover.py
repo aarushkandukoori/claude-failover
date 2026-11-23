@@ -185,6 +185,12 @@ class ClaimTest(unittest.TestCase):
         self.assertFalse(dh.claim_is_live(claim, self.CUT, 1000.0 + dh.CLAIM_MINUTES * 60))   # never sent
         self.assertFalse(dh.claim_is_live(claim, "2026-11-23T02:40:00-05:00", 1000.0))       # cut off again
         self.assertFalse(dh.claim_is_live(claim, self.CUT, 999.0))                           # a clock that went back
+        # A claim is for the account the app was on: a run under another account died with it.
+        mine = dict(claim, account="work")
+        self.assertTrue(dh.claim_is_live(mine, self.CUT, 1000.0, "work"))
+        self.assertTrue(dh.claim_is_live(mine, self.CUT, 1000.0))             # nobody asks for which
+        self.assertFalse(dh.claim_is_live(mine, self.CUT, 1000.0, "personal"))
+        self.assertTrue(dh.claim_is_live(claim, self.CUT, 1000.0, "personal"))   # an older claim names none
 
     def test_what_is_not_a_claim(self):
         for claim in (None, {}, "yes", {"cut_at": self.CUT}, {"cut_at": self.CUT, "claimed_at": "now"},

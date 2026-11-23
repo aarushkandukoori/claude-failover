@@ -244,14 +244,19 @@ def pickup_plan(mine, theirs, base, want_armed, now_ms):
     want_armed  True = it should start at the next sign-in there, False = it must not
 
     Returns (entry, action): the other account's entry as it should be (None for
-    no entry) and "arm", "disarm" or None when it is already right. No input is
-    changed."""
+    no entry) and "arm", "update", "disarm" or None when it is already right. No
+    input is changed."""
     if not want_armed:
         if theirs is not None and theirs.get("enabled") is True:
             return dict(copy.deepcopy(theirs), enabled=False), "disarm"
         return (copy.deepcopy(theirs) if theirs is not None else None), None
     if theirs is not None and is_armed(theirs, now_ms):
-        return copy.deepcopy(theirs), None
+        # Armed already. It still takes over what the app stored for the task on the
+        # signed-in account since (a permission mode the person gave it, approvals).
+        fresh = copy.deepcopy(theirs)
+        fresh.update({k: copy.deepcopy(v) for k, v in (mine or {}).items()
+                      if k in PICKUP_KEEP and k not in ("id", "createdAt")})
+        return fresh, (None if same(fresh, theirs) else "update")
     merged = dict(base)
     for older in (theirs, mine):   # the signed-in account's settings count most
         merged.update({k: copy.deepcopy(v) for k, v in (older or {}).items() if k in PICKUP_KEEP})

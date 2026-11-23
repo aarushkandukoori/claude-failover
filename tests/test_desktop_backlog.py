@@ -92,13 +92,14 @@ class PlanTest(unittest.TestCase):
 
     def plan(self, source, target, seen=None):
         """plan() without its list of items that found no room, with a check that it
-        never changes what it was given."""
+        never changes what it was given. `seen` = what the signed-in list held before."""
         return self.full_plan(source, target, seen)[:4]
 
     def full_plan(self, source, target, seen=None):
-        before = copy.deepcopy((source, target, seen))
-        out = db.plan(source, target, seen, NOW)
-        self.assertEqual((source, target, seen), before)
+        gone = sorted(set(seen or ()) - set(db.keys(source)))    # what left the signed-in list
+        before = copy.deepcopy((source, target, gone))
+        out = db.plan(source, target, gone, NOW)
+        self.assertEqual((source, target, gone), before)
         return out
 
     def test_the_other_list_is_never_filled_past_what_the_app_keeps(self):
@@ -108,24 +109,43 @@ class PlanTest(unittest.TestCase):
         own = [item("own%02d" % i, age_days=20, filedAt=NOW - 20 * DAY + i) for i in range(10)]
         mine = [item("new%02d" % i, age_days=2, filedAt=NOW - 2 * DAY + i) for i in range(15)]
         new, added, removed, only_there, no_room = self.full_plan(mine, own)
-        self.assertEqual((len(new), len(added), removed, only_there), (20, 10, [], 10))
+        # Three places stay free: the app's own next items must not push anything out.
+        self.assertEqual(db.FOLDER_ROOM, db.FOLDER_CAP - 3)
+        self.assertEqual((len(new), len(added), removed, only_there), (17, 7, [], 10))
         self.assertEqual(new[:10], own)                               # all of its own are still there
-        self.assertEqual(added, ["Task new%02d" % i for i in range(5, 15)])   # the newest ten, in order
-        self.assertEqual(no_room, ["Task new%02d" % i for i in range(5)])
+        self.assertEqual(added, ["Task new%02d" % i for i in range(8, 15)])   # the newest seven, in order
+        self.assertEqual(no_room, ["Task new%02d" % i for i in range(8)])
         # Another folder has room of its own, and a folder is the same folder however it is spelled.
         elsewhere = [item("else", cwd="/Users/me/other")]
         respelled = [item("slash", cwd="/Users/me/proj/"), item("upper", cwd="/Users/Me/Proj")]
         _new, added, _r, _o, no_room = self.full_plan(elsewhere + respelled, new)
         self.assertEqual((added, no_room), (["Task else"], ["Task slash", "Task upper"]))
 
-    def test_at_most_100_items_in_all(self):
-        full = [item("t%03d" % i, cwd="/f/%d" % (i // 10)) for i in range(100)]
+    def test_room_is_left_in_the_whole_list_too(self):
+        self.assertEqual(db.TOTAL_ROOM, db.TOTAL_CAP - 10)
+        full = [item("t%03d" % i, cwd="/f/%d" % (i // 10)) for i in range(90)]
         new, added, _r, _o, no_room = self.full_plan([item("one more", cwd="/somewhere/new")], full)
-        self.assertEqual((len(new), added, no_room), (100, [], ["Task one more"]))
+        self.assertEqual((len(new), added, no_room), (90, [], ["Task one more"]))
         # Items the app is about to drop for their age do not take up room.
         aged = [dict(i, suggestedAt=NOW - 40 * DAY) for i in full[:1]] + full[1:]
         _new, added, _r, _o, no_room = self.full_plan([item("one more", cwd="/somewhere/new")], aged)
         self.assertEqual((added, no_room), (["Task one more"], []))
+
+    def test_an_item_the_app_pushed_out_of_a_full_folder_is_not_removed(self):
+        # The signed-in list is full in this folder (20), so an item that left it was
+        # most likely pushed out by the app to make room, not started. It stays here.
+        full = [item("s%02d" % i) for i in range(20)]
+        target = [item("pushed-out"), item("s00")]
+        new, _added, removed, _only, _no_room = self.full_plan(full, target, seen=[key("pushed-out")])
+        self.assertEqual((removed, [i["title"] for i in new][:2]), ([], ["Task pushed-out", "Task s00"]))
+        # With room in that folder, leaving the list means it was started or dropped.
+        new, _added, removed, _only, _no_room = self.full_plan(full[:19], target, seen=[key("pushed-out")])
+        self.assertEqual(removed, ["Task pushed-out"])
+        # A full list (100) is the same doubt, whatever the folder.
+        many = [item("m%03d" % i, cwd="/f/%d" % (i // 10)) for i in range(100)]
+        _new, _added, removed, _only, _no_room = self.full_plan(many, [item("pushed-out", cwd="/elsewhere")],
+                                                            seen=[key("pushed-out")])
+        self.assertEqual(removed, [])
 
     def test_missing_items_are_added(self):
         own = item("theirs")
@@ -184,6 +204,60 @@ class PlanTest(unittest.TestCase):
         b_after_the_app = [i for i in b if i["title"] != "Task x"]        # started on B
         a, added, removed, _o = self.plan(b_after_the_app, a, seen=db.keys(b))
         self.assertEqual((a, added, removed), ([item("y")], [], ["Task x"]))
+
+
+class MemoryTest(unittest.TestCase):
+    """What a list is known to hold, and what left it."""
+    T0 = 1000.0
+
+    def test_an_old_note_is_read_as_held_items(self):
+        self.assertEqual(db.memory(["b", "a"]), {"held": ["a", "b"], "pending": {}, "ours_seen_at": None})
+        self.assertEqual(db.memory(None), {"held": [], "pending": {}, "ours_seen_at": None})
+        mem = {"held": ["a"], "pending": {"x": 5.0, "bad": "soon"}, "ours_seen_at": 9.0, "extra": 1}
+        self.assertEqual(db.memory(mem), {"held": ["a"], "pending": {"x": 5.0}, "ours_seen_at": 9.0})
+
+    def test_a_write_makes_its_additions_pending(self):
+        mem = db.after_write(db.memory(["own", "leaves"]), ["own", "x", "y"], ["x", "y"], self.T0)
+        self.assertEqual(mem, {"held": ["own"], "pending": {"x": self.T0, "y": self.T0},
+                               "ours_seen_at": self.T0})
+        # A later write keeps the first write's time for what it had added.
+        mem = db.after_write(mem, ["own", "x", "y", "z"], ["z"], self.T0 + 50)
+        self.assertEqual(mem["pending"], {"x": self.T0, "y": self.T0, "z": self.T0 + 50})
+
+    def test_while_the_file_is_still_ours_nothing_is_known_to_have_left(self):
+        mem = {"held": ["own"], "pending": {"x": self.T0}, "ours_seen_at": self.T0}
+        new, gone = db.resolve(mem, ["own", "x"], True, self.T0 + 600)
+        self.assertEqual((new, gone), ({"held": ["own"], "pending": {"x": self.T0},
+                                        "ours_seen_at": self.T0 + 600}, []))
+
+    def test_the_apps_save_settles_what_it_holds(self):
+        mem = {"held": ["own", "old"], "pending": {"x": self.T0, "y": self.T0}, "ours_seen_at": self.T0}
+        # It kept x: so it had read the write, and y, which is missing, was started there.
+        new, gone = db.resolve(mem, ["own", "x", "fresh"], False, self.T0 + 5)
+        self.assertEqual(new, {"held": ["fresh", "own", "x"], "pending": {}, "ours_seen_at": None})
+        self.assertEqual(gone, ["old", "y"])
+
+    def test_a_save_without_any_of_a_fresh_write_proves_nothing(self):
+        # None of what was just written is there: the app may have saved an older copy
+        # of the list over it. Those items were not started. Only its own item left.
+        mem = {"held": ["own", "old"], "pending": {"x": self.T0, "y": self.T0}, "ours_seen_at": self.T0}
+        new, gone = db.resolve(mem, ["own"], False, self.T0 + 5)
+        self.assertEqual((new["held"], new["pending"], gone), (["own"], {}, ["old"]))
+
+    def test_a_write_that_sat_there_for_a_while_was_read(self):
+        # A later look still found the file as written, two minutes on: whenever the
+        # app opened that list afterwards, it read the write. So x was started.
+        mem = {"held": ["own"], "pending": {"x": self.T0}, "ours_seen_at": self.T0 + db.SETTLE_SECONDS}
+        self.assertEqual(db.resolve(mem, ["own"], False, self.T0 + 900)[1], ["x"])
+        mem["ours_seen_at"] = self.T0 + db.SETTLE_SECONDS - 1
+        self.assertEqual(db.resolve(mem, ["own"], False, self.T0 + 900)[1], [])
+
+    def test_an_older_write_is_proven_by_a_newer_one(self):
+        # y came with a later write and is still there, so the app read that write
+        # and with it the earlier one: x was started. z came later still: no proof.
+        mem = {"held": [], "pending": {"x": self.T0, "y": self.T0 + 10, "z": self.T0 + 20},
+               "ours_seen_at": self.T0 + 20}
+        self.assertEqual(db.resolve(mem, ["y"], False, self.T0 + 30)[1], ["x"])
 
 
 if __name__ == "__main__":

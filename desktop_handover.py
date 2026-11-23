@@ -148,13 +148,17 @@ def is_alive(cli_id, born, running):
     return born is not None and any(abs(born - start) <= NEW_CHAT_SLACK for start in starts)
 
 
-def claim_is_live(claim, cut_at, now):
+def claim_is_live(claim, cut_at, now, account=None):
     """True while a claim on a chat stands. Whoever restarts a cut-off chat claims
     it first, so that two helpers never both send it "continue". A claim is for
     one cut (`cut_at`, the time of the chat's last entry): once the chat moves
-    on and is cut off again, that is a new cut. And it lasts CLAIM_MINUTES, in
-    case the restart was claimed but never sent. `now` in unix seconds."""
+    on and is cut off again, that is a new cut. It lasts CLAIM_MINUTES, in case
+    the restart was claimed but never sent. And it is for the account the app
+    was signed in to (`account`): a run that claimed under another account died
+    with that sign-out. `now` in unix seconds."""
     if not isinstance(claim, dict) or claim.get("cut_at") != cut_at:
+        return False
+    if account is not None and claim.get("account") not in (None, account):
         return False
     at = claim.get("claimed_at")
     return (isinstance(at, (int, float)) and not isinstance(at, bool)

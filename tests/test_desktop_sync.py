@@ -1844,9 +1844,49 @@ class BacklogTest(BacklogBase):
         self.sync()
         self.assertEqual(sorted(self.titles("work")), ["Later a", "Later b", "Later own"])
 
+    def test_a_copied_card_that_was_started_there_does_not_come_back(self):
+        # x and y were copied to work. The app signs in to work and x is started there.
+        # That save is the app's first of work's list, and it still has y, which only
+        # the copy had brought: so the app had read the copy, and x was started.
+        self.put_backlog("personal", [later("x"), later("y")])
+        self.put_backlog("work", [later("w")])
+        self.sign_in(P_ACCT)
+        self.sync()
+        self.sign_in(W_ACCT)
+        self.sync()
+        self.put_backlog("work", [later("w"), later("y")])       # the app's save, x started
+        r = self.sync()
+        self.assertEqual(self.brow(r, "personal")["removed"], ["Later x"])
+        self.assertEqual(sorted(self.titles("personal")), ["Later w", "Later y"])
+        self.sign_in(P_ACCT)                                      # and it does not come back
+        r = self.sync()
+        self.assertEqual((self.brow(r)["added"], sorted(self.titles("work"))),
+                         ([], ["Later w", "Later y"]))
+
+    def test_a_single_copied_card_counts_once_the_copy_has_sat_there(self):
+        # Only one card was copied, so after the switch no other card can show that the
+        # app read the copy. But the copy had been in the file for minutes when a later
+        # sync still found it untouched: whenever the app opened the list, it read it.
+        self.put_backlog("personal", [later("x")])
+        self.put_backlog("work", [])
+        self.sign_in(P_ACCT)
+        self.sync()
+        state = self.state / "desktop-sync" / "backlog-seen.json"
+        seen = json.loads(state.read_text())
+        key = "%s/%s" % (W_ACCT, W_ORG)
+        self.assertEqual(list(seen[key]["pending"]), ["local_chat-x task_x"])
+        seen[key]["pending"]["local_chat-x task_x"] -= 300          # written five minutes ago
+        state.write_text(json.dumps(seen))
+        self.sync()                                                 # a later look: still untouched
+        self.sign_in(W_ACCT)
+        self.put_backlog("work", [])                                # x was started on work
+        r = self.sync()
+        self.assertEqual((self.brow(r, "personal")["removed"], self.titles("personal")), (["Later x"], []))
+
     def test_a_full_folder_gets_no_more(self):
-        # The app keeps 20 items per folder. Work has 19 of its own in this one.
-        own = [later("own%02d" % i, age_days=10) for i in range(19)]
+        # The app keeps 20 items per folder, and sync leaves three places free for the
+        # app's own next items. Work has 16 of its own in this folder: one more fits.
+        own = [later("own%02d" % i, age_days=10) for i in range(16)]
         self.put_backlog("personal", [later("old", age_days=5), later("mid", age_days=3),
                                       later("new", age_days=1)])
         self.put_backlog("work", own)
@@ -1854,12 +1894,12 @@ class BacklogTest(BacklogBase):
         r = self.sync()
         row = self.brow(r)
         self.assertEqual((row["added"], row["skipped"], row["only_there"]),
-                         (["Later new"], ["Later old", "Later mid"], 19))
-        self.assertEqual(self.titles("work"), ["Later own%02d" % i for i in range(19)] + ["Later new"])
+                         (["Later new"], ["Later old", "Later mid"], 16))
+        self.assertEqual(self.titles("work"), ["Later own%02d" % i for i in range(16)] + ["Later new"])
         lines = ds.report_lines(r)
         self.assertIn("  work: 1 added, 2 not copied (no room)", lines)
-        self.assertIn("    not copied - Later old (its folder or the whole list is full: the app keeps "
-                      "20 items per folder and 100 in all)", lines)
+        self.assertIn("    not copied - Later old (its folder or the whole list is nearly full: the "
+                      "app keeps 20 items per folder and 100 in all)", lines)
         # Nothing more to write, and it keeps saying what does not fit.
         again = self.sync()
         self.assertEqual((self.brow(again)["added"], self.brow(again)["written"],
@@ -2087,7 +2127,16 @@ def returned(text, at):
 
 class ChatsBase(Base):
     """Chat records with transcripts that end in a given way."""
-    A, B, C = "2026-11-23T05:26:01.000Z", "2026-11-23T05:26:20.000Z", "2026-11-23T05:26:23.000Z"
+
+    def setUp(self):
+        super().setUp()
+        # Three moments a few minutes back, as the app writes them: a prompt, a call, a result.
+        self.A, self.B, self.C = self.recent(180), self.recent(120), self.recent(60)
+
+    def recent(self, seconds_ago=60):
+        """A time `seconds_ago` back, the way transcript entries carry it."""
+        at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=seconds_ago)
+        return at.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
     def chat(self, sid, entries, account="personal", **fields):
         """A chat record plus its transcript."""
@@ -2184,10 +2233,21 @@ class HandoverTest(ChatsBase):
             self.assertEqual(self.states(), [])
             self.assertNotIn("cli-old.jsonl", opened)
 
+    def test_a_chat_that_stopped_long_ago_is_not_recent_because_its_file_changed(self):
+        # Opening an old chat makes the app add lines to its transcript. The chat still
+        # stopped three days ago.
+        long_ago = self.recent(3 * 86400)
+        self.chat("old-cut", [said("go", long_ago), called("Bash", "Run the build", long_ago),
+                              returned("Exit code 137", long_ago), {"type": "last-prompt"}])
+        self.cut_off("fresh-cut")
+        self.assertEqual(self.states(), [("local_fresh-cut", "cut_off")])
+        self.assertEqual(sorted(self.states(hours=100)),
+                         [("local_fresh-cut", "cut_off"), ("local_old-cut", "cut_off")])
+
     def test_order_newest_first_and_waiting_last(self):
         self.chat("early", [said("go", self.A), returned("x", self.A)])
         self.chat("late", [said("go", self.A), returned("x", self.C)])
-        self.chat("waits", [said("go", self.A), answered("Which one?", "2026-11-23T05:59:00.000Z")],
+        self.chat("waits", [said("go", self.A), answered("Which one?", self.recent(5))],
                   lastAssistantUuid="u1", postTurnSummaryFor="u1",
                   postTurnSummary={"status_category": "blocked", "needs_action": "Which one?"})
         self.assertEqual(self.states(), [("local_late", "cut_off"), ("local_early", "cut_off"),
@@ -2398,12 +2458,12 @@ class RestartTest(ChatsBase):
         patcher = mock.patch.object(ds, "RESTART_RECHECK_SECONDS", 0)   # no waiting in tests
         patcher.start()
         self.addCleanup(patcher.stop)
+        # Auto-restart is on and the signed-in account has usage, unless a test says otherwise.
+        self.cfg["desktop_sync"]["auto_restart"] = True
+        self.usage = mock.patch.object(ds, "usage_verdict", return_value=(True, None))
+        self.usage.start()
+        self.addCleanup(self.usage.stop)
         self.sign_in(W_ACCT)
-
-    def recent(self, seconds_ago=60):
-        """A time of a cut `seconds_ago` back, as the app writes it."""
-        at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=seconds_ago)
-        return at.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
     def cut(self, sid, at=None, **fields):
         at = at or self.recent()
@@ -2426,7 +2486,7 @@ class RestartTest(ChatsBase):
         self.assertEqual(chat["message"], ds.desktop_handover.restart_message(
             ds.clock(chat["cut_at"]), "Bash - Run the build"))
         claim = self.claims()["local_killed"]
-        self.assertEqual(claim["cut_at"], chat["cut_at"])
+        self.assertEqual((claim["cut_at"], claim["account"]), (chat["cut_at"], "work"))
         self.assertLess(abs(claim["claimed_at"] - time.time()), 30)
         events = [json.loads(line) for line in (self.state / "events.jsonl").read_text().splitlines()]
         self.assertEqual([(e["event"], e["account"], e["chats"]) for e in events],
@@ -2536,33 +2596,156 @@ class RestartTest(ChatsBase):
                                          "title": "Process was only restarting",
                                          "why": "it moved on while this ran"}])
 
-    def test_nothing_is_restarted_on_an_account_that_is_out_of_usage(self):
+    def test_nothing_is_restarted_unless_the_account_is_known_to_have_usage(self):
         self.cut("killed")
-        with mock.patch.object(ds, "out_of_usage", return_value="Nov 28, 11:00 PM") as out:
+        self.usage.stop()
+        for verdict in ((False, "work is out of usage until Nov 28, 11:00 PM"),
+                        (False, "there is no current usage reading for work")):
+            with mock.patch.object(ds, "usage_verdict", return_value=verdict) as asked:
+                r = ds.restart_claims(self.cfg)
+            asked.assert_called_once_with(self.cfg, "work")
+            self.assertEqual((r["chats"], r["skipped"]), ([], []))
+            self.assertEqual(r["note"], "%s, so nothing is restarted" % verdict[1])
+        # No switch helper at all: nothing is known, so nothing is restarted.
+        with mock.patch.dict(sys.modules, {"account_switch": None}):
             r = ds.restart_claims(self.cfg)
-        out.assert_called_once_with("work")
-        self.assertEqual((r["chats"], r["skipped"]), ([], []))
-        self.assertEqual(r["note"], "the app is signed in to work, which is out of usage until "
-                                    "Nov 28, 11:00 PM, so nothing is restarted")
+        self.assertEqual((r["chats"], r["note"]), ([], "there are no usage readings (they come from a "
+                                                       "switch helper), so nothing is restarted"))
         self.assertEqual(self.claims(), {})
+        self.usage.start()
 
-    def test_usage_readings_come_from_the_switch_helper(self):
-        soon = cf.iso(cf.now_local() + dt.timedelta(days=3))
-        past = cf.iso(cf.now_local() - dt.timedelta(hours=1))
+    def test_nothing_is_restarted_when_the_signed_in_account_cannot_be_named(self):
+        self.cut("killed")
+        self.usage.stop()
         fake = types.ModuleType("account_switch")
-        usage = {"spent": {"week_util": 0.99, "week_resets_at": soon},
-                 "fresh": {"week_util": 0.03, "week_resets_at": soon},
-                 "reset": {"week_util": 1.0, "week_resets_at": past},
-                 "odd": {"week_util": "a lot"}, "bare": {}}
-        fake.read_state = lambda: {"usage": usage}
+        fake.snapshot = lambda cfg, extension=None: {"accounts": {}}
         with mock.patch.dict(sys.modules, {"account_switch": fake}):
-            self.assertEqual(ds.out_of_usage("spent"), ds.clock(soon))
-            for account in ("fresh", "reset", "odd", "bare", "nobody"):
-                self.assertIsNone(ds.out_of_usage(account), account)
-            fake.read_state = lambda: 1 / 0
-            self.assertIsNone(ds.out_of_usage("spent"))
-        with mock.patch.dict(sys.modules, {"account_switch": None}):     # no switch helper at all
-            self.assertIsNone(ds.out_of_usage("spent"))
+            self.sign_in(T_ACCT)            # an account that is not in the config
+            r = ds.restart_claims(self.cfg)
+            self.assertEqual((r["account"], r["chats"]), (None, []))
+            self.assertEqual(r["note"], "cannot tell which account the app is signed in to, so nothing "
+                                        "is restarted")
+            (self.desktop / "config.json").write_text("{}")     # the app does not name one yet
+            self.assertEqual(ds.restart_claims(self.cfg)["chats"], [])
+        self.assertEqual(self.claims(), {})
+        self.usage.start()
+
+    def test_usage_is_known_only_from_a_good_reading(self):
+        self.usage.stop()
+        now = cf.now_local()
+
+        def reading(**more):
+            base = {"out": False, "spent": False, "room": 0.6, "week_room": 0.7, "extra": False,
+                    "extra_in_use": False, "read_at": now - dt.timedelta(minutes=30), "back": None}
+            base.update(more)
+            return base
+
+        back = now + dt.timedelta(days=3)
+        accounts = {
+            "fine": reading(),
+            "fine-old": reading(read_at=now - dt.timedelta(minutes=200)),
+            "out": reading(out=True, spent=True, room=0.0, back=back),
+            "login": reading(out=True),
+            "unread": reading(room=None, read_at=None),
+            "stale": reading(room=None),                 # the helper no longer trusts the reading
+            "paying": reading(extra=True, extra_in_use=True),
+            "nearly": reading(room=0.02),
+            "week-gone": reading(week_room=0.01),
+            "extra-fresh": reading(extra=True),
+            "extra-old": reading(extra=True, read_at=now - dt.timedelta(minutes=120)),
+        }
+        fake = types.ModuleType("account_switch")
+        fake.snapshot = lambda cfg, extension=None: {"accounts": accounts}
+        with mock.patch.dict(sys.modules, {"account_switch": fake}):
+            self.assertEqual(ds.usage_verdict(self.cfg, "fine"), (True, None))
+            self.assertEqual(ds.usage_verdict(self.cfg, "fine-old"), (True, None))
+            self.assertEqual(ds.usage_verdict(self.cfg, "extra-fresh"), (True, None))
+            no = {name: ds.usage_verdict(self.cfg, name)[1] for name in accounts
+                  if not ds.usage_verdict(self.cfg, name)[0]}
+            self.assertEqual(no, {
+                "out": "out is out of usage until %s" % ds.clock(cf.iso(back)),
+                "login": "login is out of usage",
+                "unread": "there is no current usage reading for unread",
+                "stale": "there is no current usage reading for stale",
+                "paying": "paying is running on paid extra usage",
+                "nearly": "nearly has almost no usage left",
+                "week-gone": "week-gone has almost no usage left",
+                "extra-old": "the last usage reading for extra-old is 120 minutes old, and it has "
+                             "paid extra usage turned on"})
+            # For arming the pick-up task the age of the reading is left to the helper.
+            self.assertEqual(ds.usage_verdict(self.cfg, "extra-old", strict=False), (True, None))
+            self.assertEqual(ds.usage_verdict(self.cfg, "nobody"),
+                             (False, "there is no usage reading for nobody"))
+            self.assertEqual(ds.usage_verdict(self.cfg, None),
+                             (False, "cannot tell which account the app is signed in to"))
+            fake.snapshot = lambda cfg, extension=None: 1 / 0
+            self.assertEqual(ds.usage_verdict(self.cfg, "fine")[0], False)
+        self.usage.start()
+
+    def test_the_off_switch_stops_a_run_that_starts_anyway(self):
+        self.cut("killed")
+        self.cfg["desktop_sync"]["auto_restart"] = False
+        r = ds.restart_claims(self.cfg)
+        self.assertEqual((r["chats"], r["note"]), ([], "auto-restart is off, so nothing is restarted"))
+        self.assertEqual(self.claims(), {})
+        rc, out = self.run_cli("restart")
+        self.assertIn("  note - auto-restart is off, so nothing is restarted", out.splitlines())
+        # A person who asks by hand still gets them.
+        rc, out = self.run_cli("restart", "--by-hand", "--json")
+        self.assertEqual([c["session"] for c in json.loads(out)["chats"]], ["local_killed"])
+
+    def test_one_run_restarts_a_few_chats_at_most(self):
+        for i in range(5):
+            self.cut("c%d" % i, self.recent(600 - 60 * i), title="Chat %d" % i)   # c4 is the newest
+        r = ds.restart_claims(self.cfg)
+        self.assertEqual(ds.RESTART_MAX, 3)
+        self.assertEqual([c["session"] for c in r["chats"]], ["local_c4", "local_c3", "local_c2"])
+        self.assertEqual(r["skipped"], [
+            {"session": "local_c%d" % i, "title": "Chat %d" % i,
+             "why": "more than 3 chats to restart at once: continue it by hand"} for i in (1, 0)])
+        self.assertEqual(sorted(self.claims()), ["local_c2", "local_c3", "local_c4"])
+        # The number can be set, within reason.
+        os.unlink(str(self.state / "desktop-sync" / "restarts.json"))
+        for setting, expected in ((1, 1), (0, 3), (99, 3), ("many", 3), (True, 3)):
+            self.cfg["desktop_sync"]["restart_max"] = setting
+            self.assertEqual(len(ds.restart_claims(self.cfg, dry_run=True)["chats"]), expected, setting)
+
+    def test_the_gate_command_can_say_not_now(self):
+        self.cut("killed")
+        self.cfg["desktop_sync"]["restart_gate"] = "exit 3"
+        r = ds.restart_claims(self.cfg)
+        self.assertEqual((r["chats"], r["note"]), ([], "the restart gate command says not now (exit "
+                                                       "code 3), so nothing is restarted"))
+        self.assertEqual(self.claims(), {})
+        marker = self.tmp / "gate-ran"
+        self.cfg["desktop_sync"]["restart_gate"] = "touch %s" % ds.shlex.quote(str(marker))
+        self.assertEqual(len(ds.restart_claims(self.cfg)["chats"]), 1)
+        self.assertTrue(marker.exists())
+        with mock.patch.object(ds.subprocess, "run", side_effect=OSError("no sh")):
+            self.assertEqual(ds.gate_says_no(self.cfg), "the restart gate command could not be run (no sh)")
+        self.cfg["desktop_sync"]["restart_gate"] = "  "
+        self.assertIsNone(ds.gate_says_no(self.cfg))
+
+    def test_a_claim_made_under_the_other_account_does_not_hold(self):
+        # The app was signed in to personal for a moment: the pick-up run there claimed the
+        # chat and died with the next sign-out, before its message arrived.
+        self.cut("killed")
+        self.sign_in(P_ACCT)
+        self.assertEqual(len(ds.restart_claims(self.cfg)["chats"]), 1)
+        self.assertEqual(self.claims()["local_killed"]["account"], "personal")
+        self.assertEqual(ds.restart_claims(self.cfg)["chats"], [])       # still taken there
+        self.sign_in(W_ACCT)
+        self.assertIsNone(ds.handover(self.cfg)["chats"][0]["restart_sent"])
+        self.assertEqual([c["session"] for c in ds.restart_claims(self.cfg)["chats"]], ["local_killed"])
+
+    def test_a_cut_from_long_ago_is_not_restarted_because_its_file_changed(self):
+        long_ago = self.recent(7 * 3600)
+        self.chat("old-cut", [said("go", long_ago), called("Bash", "Run the build", long_ago),
+                              returned("Exit code 137", long_ago), {"type": "last-prompt"}],
+                  title="Cut off this morning")
+        self.assertEqual(self.states(), [("local_old-cut", "cut_off")])      # on the list, not restarted
+        r = ds.restart_claims(self.cfg)
+        self.assertEqual((r["chats"], self.claims()), ([], {}))
 
     def test_dry_run_claims_nothing(self):
         self.cut("killed", title="Killed by the sign-out")
@@ -2589,10 +2772,17 @@ class RestartTest(ChatsBase):
         self.assertIn("  left alone:", out.splitlines())
         self.assertTrue(out.splitlines()[-1].startswith("    Killed by the sign-out - a restart was "
                                                         "sent at "))
-        self.cfg["accounts"] = []
+        self.cfg["desktop_sync"]["restart_gate"] = "exit 1"
         rc, out = self.run_cli("restart")
-        self.assertEqual(out.splitlines(), ["Chats to restart (cut off in the last 6 hours)",
-                                            "  nothing to restart"])
+        self.assertEqual(out.splitlines(), [
+            "Chats to restart (cut off in the last 6 hours, app signed in as work)",
+            "  note - the restart gate command says not now (exit code 1), so nothing is restarted"])
+        del self.cfg["desktop_sync"]["restart_gate"]
+        os.unlink(str(self.state / "desktop-sync" / "restarts.json"))
+        os.environ["CLAUDE_FAILOVER_RUNNING_CHATS"] = "cli-killed"      # it is working again
+        rc, out = self.run_cli("restart")
+        self.assertEqual(out.splitlines(), ["Chats to restart (cut off in the last 6 hours, app signed "
+                                            "in as work)", "  nothing to restart"])
         for bad in (("restart", "now"), ("auto-restart", "maybe"), ("auto-restart", "on", "off")):
             rc, out = self.run_cli(*bad)
             self.assertEqual((rc, out.startswith("usage: claude-accounts sync")), (2, True), bad)
@@ -2604,6 +2794,10 @@ class PickupTaskTest(TasksBase):
     def setUp(self):
         super().setUp()
         self.cfg["desktop_sync"]["auto_restart"] = True
+        # The other account is known to have usage left, unless a test says otherwise.
+        self.usage = mock.patch.object(ds, "usage_verdict", return_value=(True, None))
+        self.usage.start()
+        self.addCleanup(self.usage.stop)
         self.sign_in(P_ACCT)
 
     def pick(self, account):
@@ -2719,21 +2913,55 @@ class PickupTaskTest(TasksBase):
     def test_an_account_without_usage_is_not_armed(self):
         self.put_tasks("personal", [])
         self.put_tasks("work", [])
-        with mock.patch.object(ds, "out_of_usage", return_value="Nov 28, 11:00 PM"):
+        out = (False, "work is out of usage until Nov 28, 11:00 PM")
+        with mock.patch.object(ds, "usage_verdict", return_value=out) as asked:
             r = self.sync()
+            asked.assert_called_with(self.cfg, "work", strict=False)
             self.assertEqual(self.changes(r), [])
             self.assertIsNone(self.pick("work"))
-            rc, out = self.run_cli("status")
-            self.assertIn("  auto-restart - on, but not armed for work: it is out of usage until "
-                          "Nov 28, 11:00 PM", out.splitlines())
+            rc, text = self.run_cli("status")
+            self.assertIn("  auto-restart - on, but not armed for work: work is out of usage until "
+                          "Nov 28, 11:00 PM", text.splitlines())
         self.sync()                                                    # usage is back: armed
         self.assertTrue(self.pick("work")["enabled"])
-        with mock.patch.object(ds, "out_of_usage", return_value="Nov 28, 11:00 PM"):
+        with mock.patch.object(ds, "usage_verdict", return_value=out):
             r = self.sync()                                            # used up again: switched off
         self.assertEqual(self.changes(r), [("disarm", ds.PICKUP_ID)])
         self.assertIn("    disarm - Pick up after an account switch (work is out of usage until "
                       "Nov 28, 11:00 PM)", ds.report_lines(r))
         self.assertFalse(self.pick("work")["enabled"])
+
+    def test_without_usage_readings_nothing_is_armed(self):
+        # No switch helper, so nothing is known about the other account's usage.
+        self.usage.stop()
+        self.put_tasks("personal", [])
+        self.put_tasks("work", [])
+        with mock.patch.dict(sys.modules, {"account_switch": None}):
+            r = self.sync()
+            self.assertEqual((self.changes(r), self.pick("work")), ([], None))
+            rc, text = self.run_cli("status")
+            self.assertIn("  auto-restart - on, but not armed for work: there are no usage readings "
+                          "(they come from a switch helper)", text.splitlines())
+        self.usage.start()
+
+    def test_a_mode_given_in_the_app_reaches_a_copy_that_is_armed_already(self):
+        made_here = {"id": ds.PICKUP_ID, "displayName": "Pick up after an account switch",
+                     "enabled": True, "filePath": "/x/SKILL.md", "createdAt": BASE_MS}
+        self.put_tasks("personal", [made_here])
+        self.put_tasks("work", [])
+        self.sync()
+        armed = self.pick("work")
+        self.assertNotIn("permissionMode", armed)
+        # The person opens the task in the app and gives it a mode and an approval.
+        approvals = [{"toolName": "Bash", "ruleContent": "claude-accounts sync restart:*"}]
+        self.put_tasks("personal", [dict(made_here, permissionMode="auto", approvedPermissions=approvals)])
+        r = self.sync()
+        entry = self.pick("work")
+        self.assertEqual(self.changes(r), [("update", ds.PICKUP_ID)])
+        self.assertEqual((entry["permissionMode"], entry["approvedPermissions"]), ("auto", approvals))
+        self.assertEqual((entry["fireAt"], entry["enabled"]), (armed["fireAt"], True))   # still armed
+        self.assertIn("  work: 1 updated", ds.report_lines(r))
+        self.assertEqual(self.changes(self.sync()), [])
 
     def test_dry_run_arms_nothing(self):
         self.put_tasks("personal", [])
@@ -2768,6 +2996,9 @@ class PickupTaskTest(TasksBase):
         self.assertTrue(r["errors"][0].startswith("could not update the scheduled tasks of work: "))
 
     def test_switching_it_on_and_off(self):
+        self.put_tasks("personal", [])
+        self.put_tasks("work", [])
+        self.cfg["desktop_sync"] = {"enabled": True}
         self.cfg_path.write_text(json.dumps({"accounts": [], "desktop_sync": {"enabled": True}}))
         rc, out = self.run_cli("auto-restart", "on")
         self.assertEqual(rc, 0)
@@ -2776,15 +3007,25 @@ class PickupTaskTest(TasksBase):
         self.assertIn("Set desktop_sync.auto_restart to true in ", out)
         self.assertIn("The pick-up task's instructions: %s" % ds.tilde(self.prompt()), out)
         self.assertTrue(self.prompt().exists())
+        # Switching it on arms the other account at once, not at the next background sync.
+        self.assertTrue(self.pick("work")["enabled"])
+        self.assertIn("arm - Pick up after an account switch (it restarts the chats a sign-out cut "
+                      "off, when the app signs in to work)", out.splitlines())
         rc, out = self.run_cli("auto-restart", "on")
         self.assertIn("desktop_sync.auto_restart is already true in ", out)
+        rc, out = self.run_cli("auto-restart")
+        self.assertEqual(out.splitlines(), [
+            "Restarting chats after a switch",
+            "  auto-restart - on: chats cut off by a switch restart by themselves when the app signs "
+            "in to work"])
+        # And switching it off disarms it at once.
         rc, out = self.run_cli("auto-restart", "off")
         self.assertEqual(json.loads(self.cfg_path.read_text())["desktop_sync"],
                          {"enabled": True, "auto_restart": False})
-        self.assertIn("The next sync switches the waiting pick-up task off.", out)
-        rc, out = self.run_cli("auto-restart")
-        self.assertEqual(out.splitlines()[0], "Restarting chats after a switch")
-        self.assertIn("  auto-restart - on, the next sync arms it for work", out.splitlines())
+        self.assertFalse(self.pick("work")["enabled"])
+        self.assertIn("disarm - Pick up after an account switch (auto-restart is off)", out.splitlines())
+        self.assertIn("A waiting pick-up task is switched off, and one that starts anyway restarts "
+                      "nothing.", out)
 
 
 class AppDetectionTest(unittest.TestCase):

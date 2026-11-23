@@ -216,18 +216,25 @@ The rules. All of them are in `desktop_backlog.py`.
 1. **The signed-in account's list is the source** and is only read.
 2. **Missing: added, while there is room.** An item the other account lacks is added,
    unless it is older than 30 days. The app keeps 20 items per folder and 100 in all, and
-   at a save it drops the oldest beyond that. So sync never fills a list past those
-   numbers: the newest items get the room, and the rest are reported as not copied.
-   Otherwise the app would make room by dropping that account's own items.
+   at a save it drops the oldest beyond that. So sync fills a folder only to 17 and a list
+   only to 90: the newest items get that room, the rest are reported as not copied, and
+   the places left free are for the items the app files there itself. Otherwise the app
+   would make room by dropping that account's own items.
 3. **Started or dropped: removed.** Sync remembers which items each account's list held.
    An item the signed-in account held and no longer has was started or dropped there, so
    it is removed from the other account's list too. Otherwise it would come back after a
-   switch and invite doing the work twice. An account holds an item only once the app
-   itself has saved that account's list with the item in it. An item that sync wrote into
-   a list, and that the app then never took over (it had read the file before the write,
-   or it made room), was not started there: it stays on the account it came from. Nothing
-   is removed on the first sync, and nothing when the signed-in account has no backlog
-   file at all.
+   switch and invite doing the work twice. Two things that look the same are not that:
+   - **An item the app never took over.** What sync wrote into a list counts as held
+     there only with proof that the app read that write: the app's own save kept another
+     item of the same or a later write, or a later sync still found the write untouched
+     two minutes after it was made. Without that proof the app may have saved an older
+     copy of the list over the write, and the item stays on the account it came from.
+   - **An item pushed out of a full folder.** While a folder holds 20 items, or the list
+     100, the app drops the oldest by itself. An item that left such a folder is not
+     taken off the other list.
+
+   Nothing is removed on the first sync, and nothing when the signed-in account has no
+   backlog file at all.
 4. **Only on the other account: kept.** An item the signed-in account never had stays.
    It reaches the signed-in account's list at the next switch, when the other account
    becomes the source.
@@ -316,30 +323,47 @@ restart comes from inside it, through the app's own scheduled tasks:
 What `sync restart` hands out, and what it never does:
 
 - **Only a chat that was cut off in the middle of a turn** in the last 6 hours, with no
-  process left ([the same test as the list above](#picking-up-after-a-switch)). It looks
-  twice, 5 seconds apart, and leaves a chat alone that moved in between.
+  process left ([the same test as the list above](#picking-up-after-a-switch)). The time
+  of the cut counts, not the time the file last changed. It looks twice, 5 seconds apart,
+  and leaves a chat alone that moved in between.
+- **A few at a time.** One run hands out the newest 3 (`"desktop_sync": {"restart_max":
+  N}` changes that). Every restarted chat is a heavy turn on the new account, and a dozen
+  at once is how a week of usage, or the Mac's memory, is used up. The others are listed
+  with the reason and wait for you.
 - **Never a chat twice.** A claim stands for 15 minutes or until the chat moves on, so a
-  second run, or another helper that reads `sync handover`, sees "restart sent".
+  second run, or another helper that reads `sync handover`, sees "restart sent". A claim
+  made while the app was signed in to another account does not hold: that run died with
+  the sign-out.
+- **Nothing when auto-restart is off.** A pick-up task that starts anyway (it was still
+  armed, or someone pressed Run now) gets an empty list. `sync restart --by-hand` is for a
+  person or a chat that wants the list regardless.
+- **Nothing when the gate says no.** `"desktop_sync": {"restart_gate": "<command>"}` names
+  a command that is run before any chat is handed out. Any exit code but 0 means not now,
+  for example a check that enough memory is free.
 - **Never a chat that was continued elsewhere**: one the StopFailure hook handed to
   Terminal since it stopped (a `handoff` event in the event log), or one that has a fork.
 - **Never a turn that ended at a usage limit.** That is the hook's case, and the chat is
   listed as stopped, not cut off.
 - **Never a scheduled run** (the task runs again on its schedule) and never a chat that
   waits for you: those need your answer.
-- **Not on an account that is known to be out of usage.** Sync reads no usage itself. When
-  an optional module named `account_switch` is there and its last usage reading says an
-  account has used up its week, the pick-up task is not armed there, and `sync restart`
-  hands out nothing while the app is signed in to it. Without such readings the task is
-  armed on every account.
+- **Only on an account that is known to have usage left.** Not knowing counts as no: a
+  chat restarted on an account that is out of usage stops again at once, or runs up a bill
+  when paid extra usage is turned on. Sync reads no usage itself. The readings come from
+  an optional module named `account_switch`. Its picture of an account has to say that
+  the account is not out, that its fullest window (the 5-hour one or the week) has room,
+  and that it is not running on extra usage. With extra usage turned on, the reading must
+  also be at most 90 minutes old at the moment chats are restarted. Without that module,
+  without a current reading, or when the app's account cannot be named, the pick-up task
+  is not armed and `sync restart` hands out nothing. `sync auto-restart` says which it is.
 
 What to know before turning it on:
 
 - The pick-up task runs in the permission mode that task has in the app, or your default
   mode when it has none. Sync never writes a mode into it. It copies the mode and the
   approvals that the app stored for this task on the signed-in account, as it does for
-  every task. In a mode that asks before a step, the run stops and waits for you, so for
-  a restart with nobody there, open the task in the app once and give it a mode that
-  does not ask.
+  every task, also into a copy that is armed already. In a mode that asks before a step,
+  the run stops and waits for you, so for a restart with nobody there, open the task in
+  the app once and give it a mode that does not ask.
 - Its instructions can be edited; sync writes the file only when it is missing.
 - The restarted chats use the new account's usage, and they all start within minutes of
   the sign-in.
@@ -347,7 +371,7 @@ What to know before turning it on:
   interface. If the task does not start, nothing is lost: `claude-accounts sync handover`
   still lists the chats.
 - Turning it off (`claude-accounts sync auto-restart off`) switches the waiting task off
-  at the next sync. It is never deleted by sync; delete it in the app if you want it gone.
+  at once. It is never deleted by sync; delete it in the app if you want it gone.
 
 ## A sync at sign-out
 
@@ -439,8 +463,8 @@ transcript, which `claude --resume` lists.
 - **Stop copying the task backlog** - set `"desktop_sync": {"backlog": false}`. Its
   backups are next to the task-list backups, named `backlog.<date>-<time>.json`, and go
   back the same way, over `backlog/tasks.json` in the account's folder.
-- **Stop the automatic restarts** - `claude-accounts sync auto-restart off`. The next sync
-  switches the waiting pick-up task off.
+- **Stop the automatic restarts** - `claude-accounts sync auto-restart off`. The waiting
+  pick-up task is switched off at once.
 - **Stop the sync at sign-out** - it is part of the background job. `claude-accounts sync
   uninstall` removes the job, and with it the sync on its interval.
 - **Put a task list back** - every list sync replaced has copies in

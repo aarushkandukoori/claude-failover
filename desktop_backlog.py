@@ -17,15 +17,18 @@ The rules, all in plan():
 - An item the other account lacks is added. Two entries are the same item when
   they come from the same chat and the same proposal in it (originSessionId and
   originTaskId), which is how the app itself tells them apart.
-- An item that left the signed-in account's list since the last sync was started
-  or dropped there, so it is removed from the other account's list too.
-  Otherwise it would come back after a switch and invite doing the work twice.
+- An item that left the signed-in account's list was started or dropped there,
+  so it is removed from the other account's list too. Otherwise it would come
+  back after a switch and invite doing the work twice. Two cases are not that:
+  an item the app never took over from this tool's write (resolve() tells), and
+  an item that left a folder which is full, where the app drops the oldest
+  items by itself to make room. Those stay where they are.
 - An item only the other account has, and the signed-in account never had,
   stays where it is.
 - Items older than 30 days are not copied: the app drops those itself.
-- The other list is never filled past what the app keeps (20 items per folder,
-  100 in all). The app would make room at its next save by dropping the oldest
-  items, and those could be that account's own.
+- The other list is only filled to a few places below what the app keeps (20
+  items per folder, 100 in all). Beyond that the app makes room at a save by
+  dropping the oldest items, and those could be that account's own.
 """
 
 import collections
@@ -37,6 +40,10 @@ import unicodedata
 MAX_AGE_MS = 30 * 24 * 3600 * 1000   # the app forgets a proposal this long after it was made
 FOLDER_CAP = 20                      # the app keeps this many items per folder,
 TOTAL_CAP = 100                      # and this many in all: at a save it drops the oldest beyond that
+FOLDER_ROOM = FOLDER_CAP - 3         # how far this tool fills a folder and the whole list: the
+TOTAL_ROOM = TOTAL_CAP - 10          # rest stays free for the items the app files there itself
+SETTLE_SECONDS = 120                 # a write that a later look still found untouched this long after
+                                     # it was made is one the app reads whenever it opens that list
 NEWEST_VERSION = 1                   # the file format this module knows
 
 
@@ -127,13 +134,71 @@ def label(item):
     return "(no title)"
 
 
-def plan(source, target, seen, now_ms):
+def memory(entry):
+    """What is remembered about one account's list, from its entry in
+    backlog-seen.json:
+      held          the items the app itself is known to hold there (keys)
+      pending       {key: when} for the items this tool wrote into the list that
+                    the app has not been seen to take over yet
+      ours_seen_at  when the file was last found exactly as this tool wrote it
+    An older version kept just the list of keys."""
+    if isinstance(entry, list):
+        entry = {"held": entry}
+    entry = entry if isinstance(entry, dict) else {}
+    held = entry.get("held") if isinstance(entry.get("held"), list) else []
+    pending = entry.get("pending") if isinstance(entry.get("pending"), dict) else {}
+    seen = entry.get("ours_seen_at")
+    number = (int, float)
+    return {"held": sorted({k for k in held if isinstance(k, str)}),
+            "pending": {k: float(t) for k, t in pending.items()
+                        if isinstance(k, str) and isinstance(t, number) and not isinstance(t, bool)},
+            "ours_seen_at": float(seen) if isinstance(seen, number) and not isinstance(seen, bool)
+            else None}
+
+
+def after_write(mem, new_keys, added, now):
+    """The memory of a list right after this tool wrote it: what it added is
+    pending from `now` (unix seconds) on, until the app is seen to hold it."""
+    there = set(new_keys)
+    pending = {k: t for k, t in mem["pending"].items() if k in there}
+    for k in added:
+        pending.setdefault(k, float(now))
+    return {"held": sorted(set(mem["held"]) & there), "pending": pending, "ours_seen_at": float(now)}
+
+
+def resolve(mem, now_keys, still_ours, now):
+    """Look at a list again: (its memory from here on, the keys that left it).
+
+    While the file is still byte for byte this tool's last write (`still_ours`),
+    the app has saved nothing, so nothing can have left.
+
+    Otherwise the app saved the list itself, and what it holds now is known. An
+    item counts as having left only if the list held it before. For an item this
+    tool had written there, that takes proof that the app read that write: the
+    app kept another item of the same or a later write, or a later look found the
+    write untouched at least SETTLE_SECONDS after it was made. Without that proof
+    the app may have saved an older copy of the list over the write, and the item
+    was never started there."""
+    here = set(now_keys)
+    if still_ours:
+        return dict(mem, ours_seen_at=float(now)), []
+    pending, seen = mem["pending"], mem["ours_seen_at"]
+    kept = [t for k, t in pending.items() if k in here]
+    newest = max(kept) if kept else None
+    read = {k for k, t in pending.items()
+            if (newest is not None and t <= newest)
+            or (seen is not None and seen - t >= SETTLE_SECONDS)}
+    gone = sorted((set(mem["held"]) | read) - here)
+    return {"held": sorted(here), "pending": {}, "ours_seen_at": None}, gone
+
+
+def plan(source, target, gone, now_ms):
     """What the other account's backlog should become.
 
     source   the signed-in account's items
     target   the other account's items
-    seen     the keys the signed-in account's list held at the last sync, or
-             None when that is not known (then nothing is removed)
+    gone     the keys that left the signed-in account's list (see resolve), or
+             None when nothing is known to have left
     now_ms   the time now, in ms like suggestedAt
 
     Returns (new target list, added, removed, only_there, no_room):
@@ -144,10 +209,17 @@ def plan(source, target, seen, now_ms):
     Neither input list is changed.
     """
     here = {key(item) for item in source} - {None}
-    gone = set(seen or ()) - here     # on the signed-in list last time, not any more
+    gone = set(gone or ()) - here
+    # A folder (or a list) that is full is one the app drops the oldest items from
+    # by itself. An item that left such a folder was most likely pushed out, not
+    # started, so it is not taken off the other list.
+    counts = [item for item in source if is_fresh(item, now_ms)]
+    full_folders = {f for f, n in collections.Counter(folder(i) for i in counts).items()
+                    if n >= FOLDER_CAP}
+    list_full = len(counts) >= TOTAL_CAP
     kept, removed = [], []
     for item in target:
-        if key(item) in gone:
+        if key(item) in gone and not list_full and folder(item) not in full_folders:
             removed.append(label(item))
         else:
             kept.append(copy.deepcopy(item))
@@ -167,7 +239,7 @@ def plan(source, target, seen, now_ms):
     in_folder = collections.Counter(folder(item) for item in counted)
     total, fits = len(counted), set()
     for item in sorted(wanted, key=filed, reverse=True):
-        if total < TOTAL_CAP and in_folder[folder(item)] < FOLDER_CAP:
+        if total < TOTAL_ROOM and in_folder[folder(item)] < FOLDER_ROOM:
             fits.add(key(item))
             in_folder[folder(item)] += 1
             total += 1

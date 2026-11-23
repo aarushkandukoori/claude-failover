@@ -520,6 +520,7 @@ this table lists all of them.
 | `desktop_sync.scheduled_tasks` | `true` | Each sync copies the signed-in account's desktop scheduled tasks into the other accounts' task lists. `false` = never write a task list, only list the tasks that would not run. See [DESKTOP-SYNC.md](DESKTOP-SYNC.md#scheduled-tasks). |
 | `desktop_sync.backlog` | `true` | Each sync copies the signed-in account's task backlog into the other accounts' backlogs. `false` = never write a backlog. See [DESKTOP-SYNC.md](DESKTOP-SYNC.md#the-task-backlog). |
 | `desktop_sync.auto_restart` | `false` | `true` (set by `claude-accounts sync auto-restart on`) keeps a pick-up task armed in the task list of every account the app is not signed in to. It starts when the app signs in there and restarts the chats the sign-out cut off. See [DESKTOP-SYNC.md](DESKTOP-SYNC.md#restarting-cut-off-chats-by-themselves). |
+| `desktop_sync.restart_max`, `desktop_sync.restart_gate` | `3`, none | How many chats one pick-up run restarts at most (1 to 20), and an optional command that is run before any chat is handed out: any exit code but 0 means not now. |
 | `security` | `/usr/bin/security` | The keychain tool used for spare tokens. Tests point it at a fake. |
 
 **Tip** - if your desktop app stays signed in to one account, put that account last in
