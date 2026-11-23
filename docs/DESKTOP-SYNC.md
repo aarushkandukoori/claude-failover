@@ -4,7 +4,9 @@ The Claude desktop app keeps its list of Code chats per account. Sign the app in
 another account and the sidebar is empty, even though every conversation is still on
 disk. `claude-accounts sync` copies each chat's record into every account's folder, so
 every account lists every chat, with its full history. The same run copies the signed-in
-account's [scheduled tasks](#scheduled-tasks) into the other accounts.
+account's [scheduled tasks](#scheduled-tasks) and [task backlog](#the-task-backlog) into
+the other accounts, and `claude-accounts sync handover` lists the chats that a switch left
+[in the middle of their work](#picking-up-after-a-switch).
 
 This page covers what the app stores where, how sync decides what to copy, what it
 leaves alone, and how to undo it. The rest of the design is in
@@ -22,7 +24,8 @@ leaves alone, and how to undo it. The rest of the design is in
             ├── deleted_<id>           tombstone of a deleted chat
             ├── archived-sessions.idx  load-order hint
             ├── scheduled-tasks.json   desktop scheduled tasks
-            └── backlog/  waiting-input/
+            ├── backlog/tasks.json     the task backlog (task cards set aside for later)
+            └── waiting-input/
 
 ~/.claude/projects/<folder named after the cwd>/<cliSessionId>.jsonl
                                        the conversation itself, shared by every account
@@ -124,10 +127,10 @@ Each run:
    two newest copies of each file for up to 30 days and deletes older ones. New files are
    written to a temp name and renamed into place, as plain files with a single link.
 
-Chat sync never edits `archived-sessions.idx`, `backlog/`, `waiting-input/` or any other
-file that is not a `local_*.json` record or a `deleted_*` tombstone. The one other file
-a run writes is the `scheduled-tasks.json` of accounts the app is not signed in to, by the
-rules in the next section.
+Chat sync never edits `archived-sessions.idx`, `waiting-input/` or any other file that is
+not a `local_*.json` record or a `deleted_*` tombstone. The only other files a run writes
+are the `scheduled-tasks.json` and the `backlog/tasks.json` of accounts the app is not
+signed in to, by the rules in the next two sections.
 
 ## Scheduled tasks
 
@@ -195,6 +198,98 @@ says whether the lists match right now. `"desktop_sync": {"scheduled_tasks": fal
 the config turns the copying off: sync then only lists the tasks that would not run under
 the signed-in account, as a heads-up.
 
+## The task backlog
+
+When a chat proposes a task for later and you set its card aside, the app files the task
+in a backlog, `backlog/tasks.json`, again one list per account. So every sync also copies
+the signed-in account's backlog into the other accounts' files.
+
+How the app treats the file (read from the app's bundle, Claude desktop 6.28899.6, not a
+documented interface): it reads the list when it is first needed after a sign-in, keeps
+it in memory and writes the whole file back after every change. An item is a card with a
+title, a prompt and the chat it came from. Two entries are the same item when they name
+the same chat and the same proposal in it. An item is dropped 30 days after it was
+proposed.
+
+The rules. All of them are in `desktop_backlog.py`.
+
+1. **The signed-in account's list is the source** and is only read.
+2. **Missing: added.** An item the other account lacks is added, unless it is older than
+   30 days.
+3. **Started or dropped: removed.** Sync remembers which items each list held at the last
+   sync. An item that was on the signed-in account's list then and is gone now was
+   started or dropped there, so it is removed from the other account's list too.
+   Otherwise it would come back after a switch and invite doing the work twice. Nothing
+   is removed on the first sync, and nothing when the signed-in account has no backlog
+   file at all.
+4. **Only on the other account: kept.** An item the signed-in account never had stays.
+   It reaches the signed-in account's list at the next switch, when the other account
+   becomes the source.
+
+It is as careful as the task sync: only files of accounts the app is not signed in to are
+written, through a temp file and a rename; a copy of the list goes to
+`desktop-sync/task-backups/<account id>/<organization id>/backlog.<date>-<time>.json`
+first; a file it is not sure about (not JSON, a newer format, a link) is left alone.
+`"desktop_sync": {"backlog": false}` in the config turns it off.
+
+## Picking up after a switch
+
+Signing the app out kills every chat that is in the middle of a turn. The app writes no
+mark on those chats (it only does when it quits), and nothing continues them. The same
+goes for a crash or a restart of the Mac, and a turn can also end early at a usage limit.
+`claude-accounts sync handover` finds these chats:
+
+```
+Chats to pick up (active in the last 48 hours)
+  cut off mid-turn - the app was signed out or quit; they do not go on by themselves
+    Fix the import script - cut off mid-turn at 1:03 AM (last step: Bash - Run the tests)
+      local_11111111-2222-4333-8444-555555555555
+  waiting for you
+    Name the release - waits for you since 12:24 AM: v2 or v2.0?
+      local_66666666-7777-4888-8999-aaaaaaaaaaaa
+```
+
+How it decides. The rules are in `desktop_handover.py`.
+
+- **The end of the transcript.** A finished turn ends with a reply whose `stop_reason` is
+  `end_turn`. A transcript that ends with a tool call, a tool result or a prompt has no
+  such reply: the turn was cut off. A last message that is an error (a usage limit, a
+  lapsed login) is a turn that failed. A turn you stopped yourself is neither.
+- **The process list.** While a chat works, its transcript also ends in the middle of a
+  turn. The difference is its `claude` process, which names the chat (`--resume=<id>`).
+  A brand-new chat's process names none, so it is matched by its start time. A chat
+  with a process is working and is not listed. If `ps` cannot be asked, no chat is
+  called cut off.
+- **The chat record.** After a turn the app notes on the record whether the chat needs
+  something from you. Those chats are listed as waiting.
+
+Only chats with a record in an account folder are looked at, archived ones are left out,
+and the command only reads. `--hours N` changes how far back it looks, and `--json` prints
+the list with each chat's id for a chat that picks the work up. `claude-accounts sync
+status` says how many chats there are, and `desktop_sync.handover_lines(cfg)` gives the
+list as text lines to other code.
+
+To go on with a chat, open it and say "continue". Nothing does that for you: a turn that
+was cut off in the middle of a step may have finished that step or not, so the chat
+should check before it repeats anything.
+
+## A sync at sign-out
+
+The app reads an account's folder when it signs in to that account. Whatever reached the
+folder later is not shown until the app restarts, and a change to a chat it already holds
+has to wait until it quits ([step 6](#how-sync-works)). A sync that runs every 10 minutes
+therefore left the chats of the last minutes behind at a switch.
+
+So the background job also runs whenever the app saves its own `config.json`. The app
+does that the moment it is signed out and again when it is signed in. Between those two
+moments the app has not read the other account's folder yet, so that folder can still
+take everything: new chats, changed chats, the task list and the backlog. A sync takes
+about a second, and signing in takes longer.
+
+`sync install` sets this up (`WatchPaths` in the LaunchAgent, with a 3 second pause
+between runs). A job installed by an older version keeps running on its interval only,
+and `sync status` says so: run `claude-accounts sync install` again.
+
 ## Using it
 
 ```bash
@@ -202,13 +297,15 @@ claude-accounts sync --dry-run        # show what would change, write nothing
 claude-accounts sync                  # sync once
 claude-accounts sync install          # sync every 10 minutes in the background
 claude-accounts sync install --every 5
-claude-accounts sync status           # the background job, the last run, do the task lists match
+claude-accounts sync status           # the background job, the last run, do the lists match
+claude-accounts sync handover         # the chats that were left in the middle of their work
 claude-accounts sync uninstall        # stop the background job
 ```
 
 `--json` prints a machine-readable report and `--quiet` prints nothing unless something
 went wrong (the background job uses it). The background job is a per-user LaunchAgent,
-so it runs only while you are logged in to your Mac. `sync install` also sets
+so it runs only while you are logged in to your Mac. It runs on its interval and whenever
+the app is signed out or in ([A sync at sign-out](#a-sync-at-sign-out)). `sync install` also sets
 `desktop_sync.enabled` to true in the config. With it on, the hook syncs right after a
 handoff and `claude-accounts status` adds one `Desktop chats - ...` line. The job runs this
 copy's `bin/claude-accounts` by its full path, so after you move or rename the repo folder
@@ -236,6 +333,13 @@ transcript, which `claude --resume` lists.
 - **A scheduled task's skip history and retries** - `recordedSkips` and `runRetries` stay
   with the account that recorded them.
 - **Cowork sessions and Cowork scheduled tasks** - not copied.
+- **Account plugins and claude.ai connectors** - a plugin you added to one account on
+  claude.ai, and a connector (Gmail, Calendar, ...) you connected there, belong to that
+  account on Anthropic's servers. A chat under the other account does not have their
+  skills and tools until you add them to that account too. Skills in `~/.claude/skills`
+  and plugins installed through Claude Code are local and shared.
+- **Session presets** - the app keeps them for all accounts in one file of its own, which
+  cannot be changed safely while the app runs.
 - **claude.ai web chats and connectors** - they live on Anthropic's servers, per account.
   Nothing on your Mac can move them.
 - **A chat's connector choices and Remote Control link** - stripped, because they belong
@@ -255,6 +359,11 @@ transcript, which `claude --resume` lists.
 - **Stop copying scheduled tasks** - set `"desktop_sync": {"scheduled_tasks": false}` in
   the config. The chat sync goes on. Tasks already copied stay in the other accounts'
   lists.
+- **Stop copying the task backlog** - set `"desktop_sync": {"backlog": false}`. Its
+  backups are next to the task-list backups, named `backlog.<date>-<time>.json`, and go
+  back the same way, over `backlog/tasks.json` in the account's folder.
+- **Stop the sync at sign-out** - it is part of the background job. `claude-accounts sync
+  uninstall` removes the job, and with it the sync on its interval.
 - **Put a task list back** - every list sync replaced has copies in
   `desktop-sync/task-backups/<account id>/<organization id>/` in the state folder, named
   `scheduled-tasks.<date>-<time>.json`. Turn the copying off first (the line above), or
@@ -291,10 +400,14 @@ transcript, which `claude --resume` lists.
   changes the layout, sync does less. It does not guess.
 - **New chats appear after a restart** in the folder of the account the app is using
   (step 6 above).
-- **A switch right after a change to a scheduled task.** Sync runs every few minutes. A
-  task made, changed or run in the minutes before you switch may not have reached the
-  other account yet: a run from those minutes can repeat once, and a new task stays with
-  the old account, where sync reports it. Running `claude-accounts sync` just before you
-  sign out avoids both.
+- **A switch right after a change to a scheduled task.** Sync runs every few minutes and
+  when the app is signed out. If that last run did not happen (the background job is not
+  installed, or was installed by an older version), a task made, changed or run in the
+  minutes before you switch may not have reached the other account: a run from those
+  minutes can repeat once, and a new task stays with the old account, where sync reports
+  it. Running `claude-accounts sync` just before you sign out avoids both.
+- **Chats cut off by a switch stay cut off** until someone continues them.
+  `claude-accounts sync handover` lists them. It cannot tell whether the step a chat was
+  in the middle of had finished.
 - **Scheduled tasks run under whichever account is signed in.** After a switch the copied
   tasks use that account's usage, connectors and permissions.

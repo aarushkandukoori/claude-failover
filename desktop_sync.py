@@ -97,6 +97,7 @@ MAX_ACTIONS = 2000             # actions listed in one report
 TEMP_PREFIX = ".claude-failover-"
 DEFAULT_INTERVAL = 10          # minutes between background syncs
 MIN_INTERVAL = 2
+WATCH_THROTTLE = 3             # seconds launchd waits between two runs of the background job
 COUNTS = ("added", "added_needs_restart", "updated", "retired", "stale_in_running_app",
           "deleted_elsewhere_live", "skipped_no_transcript", "skipped_invalid",
           "skipped_unsafe", "skipped_changed")
@@ -2023,6 +2024,24 @@ def installed_interval():
     return installed_job()[0]
 
 
+def watched_file(cfg):
+    """The file whose change starts a background sync: the desktop app's own
+    config.json, which the app saves when it is signed out or in."""
+    return str(desktop_dir(cfg) / "config.json")
+
+
+def job_watches(cfg):
+    """True if the installed background job also runs when the app is signed out
+    or in. A job installed by an older version only runs on its interval."""
+    try:
+        with open(str(plist_path()), "rb") as f:
+            job = plistlib.load(f)
+    except Exception:   # missing, unreadable or not a plist
+        return False
+    paths = job.get("WatchPaths") if isinstance(job, dict) else None
+    return isinstance(paths, list) and watched_file(cfg) in paths
+
+
 def job_is_broken(script):
     """True if the job's script is gone: this copy was moved or deleted after
     `sync install`, so launchd fails at every interval and nothing says so."""
@@ -2227,6 +2246,11 @@ def cmd_install(cfg, args):
            "ProgramArguments": [str(ACCOUNTS_SCRIPT), "sync", "--quiet"],
            "StartInterval": minutes * 60,
            "RunAtLoad": True,
+           # Also run whenever the app saves its own config file. It does when it is
+           # signed out and when it is signed in, so the other account's folder is up
+           # to date before the app reads it (docs/DESKTOP-SYNC.md, A sync at sign-out).
+           "WatchPaths": [watched_file(cfg)],
+           "ThrottleInterval": WATCH_THROTTLE,
            "StandardOutPath": log,
            "StandardErrorPath": log}
     env = {}
@@ -2249,7 +2273,8 @@ def cmd_install(cfg, args):
     domain = "gui/%d" % os.getuid()
     launchctl("bootout", "%s/%s" % (domain, LABEL))   # an older copy, if loaded; may fail
     rc, out = launchctl("bootstrap", domain, str(plist))
-    print("Background sync every %d min: %s" % (minutes, tilde(plist)))
+    print("Background sync every %d min, and when the app is signed out or in: %s"
+          % (minutes, tilde(plist)))
     print("Log: %s" % tilde(log))
     print(set_enabled(cfg, True))
     if rc != 0:
@@ -2288,8 +2313,12 @@ def cmd_status(cfg):
     elif minutes and os.path.realpath(script) != os.path.realpath(str(ACCOUNTS_SCRIPT)):
         lines.append("  background job - every %d min, from another copy: %s (%s)"
                      % (minutes, tilde(script), tilde(plist)))
+    elif minutes and job_watches(cfg):
+        lines.append("  background job - every %d min, and when the app is signed out or in (%s)"
+                     % (minutes, tilde(plist)))
     elif minutes:
-        lines.append("  background job - every %d min (%s)" % (minutes, tilde(plist)))
+        lines.append("  background job - every %d min (%s) - run `claude-accounts sync install` "
+                     "again to also sync when the app is signed out or in" % (minutes, tilde(plist)))
     elif os.path.lexists(str(plist)):
         lines.append("  background job - %s exists but is not a valid plist" % tilde(plist))
     else:

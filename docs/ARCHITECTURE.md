@@ -33,6 +33,8 @@ so no user packages or `PYTHON*` variables can change its behaviour).
 | `claude_failover.py` | The wrapper, the hook logic and `claude-accounts`. |
 | `desktop_sync.py` | Copies desktop app chat records between account folders, and the signed-in account's scheduled tasks to the other accounts. |
 | `desktop_tasks.py` | The rules for mirroring scheduled tasks: lists in, lists out, no file access. |
+| `desktop_backlog.py` | The rules for mirroring the task backlog, the same way. |
+| `desktop_handover.py` | How a chat's transcript ends, and so whether the chat was left in the middle of its work. |
 | `tests/` | The unittest suite, a fake `claude` binary and a fake keychain tool. |
 
 ## Account folders
@@ -227,7 +229,8 @@ limit drops the token attempt too: same account, same limit.
 - **Event log** - `state/events.jsonl` gets one JSON line per headless attempt (`run`),
   failover, hook event and handoff (`failover`, `handoff`, `hook_limit`, `hook_ignored`,
   ...), and one per desktop sync that changed something (`desktop_sync` for chats,
-  `desktop_task_sync` for a task list). Which account a chat starts on is
+  `desktop_task_sync` for a task list, `desktop_backlog_sync` for a backlog). Which
+  account a chat starts on is
   not logged. `claude-accounts log` prints the tail.
 - **A success does not clear a saved limit.** Past its limit, an account with paid extra
   usage turned on still answers, and bills for it. A limit therefore lasts until its reset
@@ -443,8 +446,11 @@ account-bound fields (connectors, Remote Control) stripped, deletions carried ov
 tombstones, and only additions in the folder the running app is using. The same run
 copies the signed-in account's scheduled tasks, with their run times, into the other
 accounts' task lists, so the same tasks are there after a switch and runs that already happened are not repeated. It
-never writes the list of the signed-in account and never deletes a task. A LaunchAgent
-can run it every few minutes. Full details: [DESKTOP-SYNC.md](DESKTOP-SYNC.md).
+never writes the list of the signed-in account and never deletes a task. The task
+backlog is mirrored the same way. A LaunchAgent runs it every few minutes and whenever
+the app is signed out or in. `claude-accounts sync handover` lists the chats a sign-out
+cut off in the middle of their work, from how their transcripts end and from the process
+list. Full details: [DESKTOP-SYNC.md](DESKTOP-SYNC.md).
 
 ## Testing
 
@@ -512,6 +518,7 @@ this table lists all of them.
 | `desktop_sync.enabled`, `desktop_sync.interval_minutes` | `false`, `10` | `enabled` (set by `sync install`) makes the hook sync after a handoff and `status` show a desktop chats line. `interval_minutes` is the interval `sync install` uses when you give no `--every`. The LaunchAgent keeps the interval it was installed with, so run `sync install` again after changing it. |
 | `desktop_sync.app_data_dir` | `~/Library/Application Support/Claude` | The desktop app's data folder. Also `$CLAUDE_FAILOVER_DESKTOP_DIR`. |
 | `desktop_sync.scheduled_tasks` | `true` | Each sync copies the signed-in account's desktop scheduled tasks into the other accounts' task lists. `false` = never write a task list, only list the tasks that would not run. See [DESKTOP-SYNC.md](DESKTOP-SYNC.md#scheduled-tasks). |
+| `desktop_sync.backlog` | `true` | Each sync copies the signed-in account's task backlog into the other accounts' backlogs. `false` = never write a backlog. See [DESKTOP-SYNC.md](DESKTOP-SYNC.md#the-task-backlog). |
 | `security` | `/usr/bin/security` | The keychain tool used for spare tokens. Tests point it at a fake. |
 
 **Tip** - if your desktop app stays signed in to one account, put that account last in
@@ -533,3 +540,4 @@ Environment variables:
 | `CLAUDE_FAILOVER_DESKTOP_DIR`, `CLAUDE_FAILOVER_LAUNCH_AGENTS_DIR` | Use another desktop app data folder or LaunchAgents folder (tests use temp folders). |
 | `CLAUDE_FAILOVER_LAUNCHCTL` | The `launchctl` that `sync install` and `sync uninstall` call, or `0` to call none (used by tests). |
 | `CLAUDE_FAILOVER_APP_RUNNING=1` or `0` | Tell desktop sync whether the app is running instead of asking `ps` (used by tests). |
+| `CLAUDE_FAILOVER_RUNNING_CHATS` | The session ids of the chats that count as running, separated by commas, instead of asking `ps` (used by tests; empty = none). |

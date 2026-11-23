@@ -895,6 +895,8 @@ class LaunchAgentTest(Base):
             "Label": ds.LABEL,
             "ProgramArguments": [str(PROJECT / "bin" / "claude-accounts"), "sync", "--quiet"],
             "StartInterval": 300, "RunAtLoad": True,
+            # Also when the app saves its config file: it does at sign-out and at sign-in.
+            "WatchPaths": [str(self.desktop / "config.json")], "ThrottleInterval": 3,
             "StandardOutPath": log, "StandardErrorPath": log,
             "EnvironmentVariables": {"CLAUDE_FAILOVER_CONFIG": str(self.cfg_path),
                                      "CLAUDE_FAILOVER_STATE_DIR": str(self.state)}})
@@ -916,7 +918,21 @@ class LaunchAgentTest(Base):
         cfg = cf.load_config()
         rc, out = self.run_cli("status", cfg=cfg)
         self.assertEqual(rc, 0)
-        self.assertIn("  background job - every 5 min", out)
+        self.assertIn("  background job - every 5 min, and when the app is signed out or in (%s)"
+                      % ds.tilde(self.plist), out.splitlines())
+        self.assertIn("Background sync every 5 min, and when the app is signed out or in: %s"
+                      % ds.tilde(self.plist), self.run_cli("install", "--every", "5", cfg=cfg)[1])
+        # A job installed by an older version runs on its interval only, and status says so.
+        with open(str(self.plist), "rb") as f:
+            old_job = plistlib.load(f)
+        del old_job["WatchPaths"]
+        with open(str(self.plist), "wb") as f:
+            plistlib.dump(old_job, f)
+        self.assertIn("  background job - every 5 min (%s) - run `claude-accounts sync install` again "
+                      "to also sync when the app is signed out or in" % ds.tilde(self.plist),
+                      self.run_cli("status", cfg=cfg)[1].splitlines())
+        self.run_cli("install", "--every", "5", cfg=cfg)
+        self.assertTrue(ds.job_watches(cfg))
         self.assertIn("  sync at handoff - on", out.splitlines())
         self.assertIn("  last sync - never", out.splitlines())
         self.assertEqual(ds.status_line(cfg), "Desktop chats - not synced yet (claude-accounts "
