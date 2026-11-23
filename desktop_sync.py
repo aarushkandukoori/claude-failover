@@ -918,8 +918,11 @@ def read_backlog(folder_path):
     """(document, raw bytes, stat) of an account folder's backlog/tasks.json. A
     missing file is ({"version": 1, "items": []}, None, None). Raises Unsafe or
     desktop_backlog.NotABacklog for a file to leave alone."""
+    folder = Path(folder_path) / BACKLOG_DIR
+    if os.path.lexists(str(folder)) and not is_real_dir(folder):
+        raise Unsafe("its backlog folder is a link")   # writes must land where we think
     try:
-        data, st = read_regular(Path(folder_path) / BACKLOG_DIR / BACKLOG_FILE, MAX_BACKLOG_BYTES)
+        data, st = read_regular(folder / BACKLOG_FILE, MAX_BACKLOG_BYTES)
     except FileNotFoundError:
         return {"version": desktop_backlog.NEWEST_VERSION, "items": []}, None, None
     return desktop_backlog.parse(data), data, st
@@ -960,13 +963,19 @@ def mirror_backlog(cfg, folders, active, sdir, dry_run, errors):
     before = seen.get(task_key(src))
     before = before if isinstance(before, list) else None
     now_ms = time.time() * 1000
-    after = {task_key(src): desktop_backlog.keys(doc["items"])}
+    after, settled = {}, True
     for dst in folders:
         if dst is not src:
             row, left = _backlog_into(cfg, doc["items"], before, dst, now_ms, sdir, dry_run, errors)
             out["targets"].append(row)
             if left is not None:
                 after[task_key(dst)] = left
+            if row["note"] or ((row["added"] or row["removed"]) and not row["written"]):
+                settled = False
+    if settled:
+        # Only now forget what this list held before: an item that left it must be
+        # taken off every other list first, or it would stay there for good.
+        after[task_key(src)] = desktop_backlog.keys(doc["items"])
     if not dry_run and any(seen.get(k) != v for k, v in after.items()):
         try:
             cf.atomic_write_json(state, dict(seen, **after))
@@ -1193,11 +1202,16 @@ def handover(cfg, hours=HANDOVER_HOURS):
     folders, _skipped = resolve_folders(cfg, desktop_dir(cfg))
     newest = {}   # chat id -> its freshest record over every account folder
     for f in folders:
+        names = []
         try:
             with os.scandir(str(f["path"])) as it:
-                names = [e.name for e in it
-                         if e.name.startswith("local_") and e.name.endswith(".json")
-                         and e.stat(follow_symlinks=False).st_mtime >= oldest]
+                for e in it:
+                    if e.name.startswith("local_") and e.name.endswith(".json"):
+                        try:
+                            if e.stat(follow_symlinks=False).st_mtime >= oldest:
+                                names.append(e.name)
+                        except OSError:
+                            pass   # gone since the listing
         except OSError:
             continue
         for name in names:

@@ -1903,6 +1903,32 @@ class BacklogTest(TasksBase):
         self.sync()
         self.assertEqual(self.titles("work"), ["Later own", "Later just-filed", "Later a"])
 
+    def test_a_removal_that_did_not_get_through_is_tried_again(self):
+        self.put_backlog("personal", [later("a"), later("b")])
+        self.sign_in(P_ACCT)
+        self.sync()
+        self.assertEqual(self.titles("work"), ["Later a", "Later b"])
+        self.put_backlog("personal", [later("b")])          # "a" was started here
+        with mock.patch.object(ds, "write_file", side_effect=OSError(28, "No space left on device")):
+            r = self.sync()
+        self.assertEqual(r["errors"], ["could not update the task backlog of work: No space left "
+                                       "on device"])
+        self.assertEqual(self.titles("work"), ["Later a", "Later b"])
+        r = self.sync()                                      # the next run still knows
+        self.assertEqual((self.brow(r)["removed"], self.titles("work")), (["Later a"], ["Later b"]))
+
+    def test_a_backlog_folder_that_is_a_link_is_left_alone(self):
+        self.put_backlog("personal", [later("a")])
+        self.sign_in(P_ACCT)
+        elsewhere = self.tmp / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "tasks.json").write_text('{"version":1,"items":[]}')
+        os.symlink(str(elsewhere), str(self.dirs["work"] / "backlog"))
+        r = self.sync()
+        self.assertEqual((elsewhere / "tasks.json").read_text(), '{"version":1,"items":[]}')
+        self.assertEqual((self.brow(r)["note"], self.brow(r)["written"], r["errors"]),
+                         ("its backlog cannot be read (its backlog folder is a link)", False, []))
+
     def test_backlog_and_task_backups_are_pruned_separately(self):
         d = self.state / "desktop-sync" / "task-backups" / W_ACCT / W_ORG
         d.mkdir(parents=True)
@@ -2064,6 +2090,27 @@ class HandoverTest(Base):
         chats = ds.handover(self.cfg)["chats"]
         self.assertEqual([(c["title"], c["cli_session"], c["state"]) for c in chats],
                          [("new name", "cli-s1-after-clear", "cut_off")])
+
+    def test_a_record_that_vanishes_during_the_listing_hides_nothing_else(self):
+        self.cut_off("stays")
+        self.cut_off("vanishes")
+        real_scandir = os.scandir
+
+        class Gone:
+            """A folder entry whose file was deleted after the listing."""
+            name = "local_vanishes.json"
+
+            def stat(self, follow_symlinks=True):
+                raise FileNotFoundError(self.name)
+
+        @contextlib.contextmanager
+        def scandir(path):
+            with real_scandir(path) as it:
+                entries = list(it)
+            yield [Gone() if e.name == Gone.name else e for e in entries]
+
+        with mock.patch.object(ds.os, "scandir", side_effect=scandir):
+            self.assertEqual(self.states(), [("local_stays", "cut_off")])
 
     def test_without_a_process_list_nothing_is_called_cut_off(self):
         self.cut_off("maybe")
